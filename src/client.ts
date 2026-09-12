@@ -311,31 +311,75 @@ function buildAnchor(range: Range): NoteAnchor {
   }
 }
 
+/** 文档里所有文本节点串成的一条「全局文本」，外加每个节点的起点偏移。 */
+interface TextIndex {
+  text: string
+  nodes: Array<{ node: Text; start: number }>
+}
+
 /**
- * 在已渲染的文档里把锚点找回来。
+ * 把 root 下的文本节点按 DOM 顺序串成一条字符串。
+ *
+ * 为什么要串：markdown 渲染会把 `**加粗**` 变成 `<strong>`，一句话被拆成好几个文本节点，
+ * 只在单个节点里 indexOf 是找不到跨格式的引用的（实测踩过）。
+ * @param root - 文档容器。
+ * @returns 全局文本与节点索引。
+ */
+function buildTextIndex(root: HTMLElement): TextIndex {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+  const nodes: Array<{ node: Text; start: number }> = []
+  let text = ''
+  let current = walker.nextNode() as Text | null
+  while (current !== null) {
+    nodes.push({ node: current, start: text.length })
+    text += current.data
+    current = walker.nextNode() as Text | null
+  }
+  return { text, nodes }
+}
+
+/**
+ * 把全局偏移映射回 (文本节点, 节点内偏移)。
+ * @param index - buildTextIndex 的结果。
+ * @param offset - 全局偏移。
+ * @returns 落点；越界返回 null。
+ */
+function pointAt(index: TextIndex, offset: number): { node: Text; offset: number } | null {
+  for (let i = index.nodes.length - 1; i >= 0; i -= 1) {
+    const entry = index.nodes[i]
+    if (offset >= entry.start) return { node: entry.node, offset: offset - entry.start }
+  }
+  return null
+}
+
+/**
+ * 在已渲染的文档里把锚点找回来（**跨文本节点**）。
  * 优先「前后缀都对上」的那一处；找不到则退化为第一处纯文本匹配。
  * @param root - 文档容器。
  * @param anchor - 批注锚点。
  * @returns 命中的 Range，找不到返回 null。
  */
 function locateRange(root: HTMLElement, anchor: NoteAnchor): Range | null {
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+  if (anchor.quote.length === 0) return null
+  const index = buildTextIndex(root)
   let fallback: Range | null = null
-  let node = walker.nextNode() as Text | null
-  while (node !== null) {
-    const text = node.data
-    let index = text.indexOf(anchor.quote)
-    while (index !== -1) {
-      const before = text.slice(Math.max(0, index - anchor.prefix.length), index)
-      const after = text.slice(index + anchor.quote.length, index + anchor.quote.length + anchor.suffix.length)
+  let from = 0
+  for (;;) {
+    const at = index.text.indexOf(anchor.quote, from)
+    if (at === -1) break
+    const startPoint = pointAt(index, at)
+    const endPoint = pointAt(index, at + anchor.quote.length)
+    if (startPoint !== null && endPoint !== null) {
+      const before = index.text.slice(Math.max(0, at - anchor.prefix.length), at)
+      const after = index.text.slice(at + anchor.quote.length, at + anchor.quote.length + anchor.suffix.length)
+      const exact = before.endsWith(anchor.prefix) && after.startsWith(anchor.suffix)
       const range = document.createRange()
-      range.setStart(node, index)
-      range.setEnd(node, index + anchor.quote.length)
-      if (before.endsWith(anchor.prefix) && after.startsWith(anchor.suffix)) return range
+      range.setStart(startPoint.node, startPoint.offset)
+      range.setEnd(endPoint.node, endPoint.offset)
+      if (exact) return range
       if (fallback === null) fallback = range
-      index = text.indexOf(anchor.quote, index + 1)
     }
-    node = walker.nextNode() as Text | null
+    from = at + 1
   }
   return fallback
 }
