@@ -33,6 +33,7 @@ const NOTES_SAVE_PATH = '/__readnote/notes/save'
 const DIAG_PATH = '/__readnote/diag'
 const ASK_PATH = '/__readnote/ask'
 const ANSWER_PATH = '/__readnote/last-answer'
+const MESSAGES_PATH = '/__readnote/messages'
 
 /**
  * 批注库放在工作区里的位置。
@@ -716,6 +717,69 @@ export function apply(ctx: any): void {
     }),
   )
 
+  // 阅读页右侧对话栏的数据源：按时间顺序返回会话里最近的若干条消息。
+  //
+  // 为什么走轮询而不是订阅：client 侧订阅会话事件流要摸 `useConversation` 那套
+  // （用法未验证）；而这是一个「你问一句、它答一句」的低频面板，2 秒轮询足够，
+  // 且不引入对宿主事件协议的依赖。真嫌慢再换订阅。
+  ctx.effect(() =>
+    host.register({
+      kind: 'exact',
+      path: MESSAGES_PATH,
+      handler: async (req: any, res: any) => {
+        if (rejectConnectionRequest(connection, req, res)) return
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { error: 'method not allowed' })
+          return
+        }
+        let payload: any = {}
+        try {
+          const raw = await readBody(req)
+          if (raw) payload = JSON.parse(raw)
+        } catch {
+          sendJson(res, 400, { error: 'bad json body' })
+          return
+        }
+        const sessionId = payload?.sessionId
+        if (typeof sessionId !== 'string' || sessionId.length === 0) {
+          sendJson(res, 400, { error: 'sessionId required' })
+          return
+        }
+        const limit = typeof payload?.limit === 'number' && payload.limit > 0 ? Math.min(payload.limit, 60) : 24
+
+        const session = ctx.get('sessions')?.get?.(sessionId)
+        if (session === undefined || session === null || typeof session.deriveMessages !== 'function') {
+          sendJson(res, 200, { ok: false, reason: 'session-not-live' })
+          return
+        }
+
+        try {
+          const all = session.deriveMessages()
+          const list = Array.isArray(all) ? all : []
+          const out: Array<{ role: string; text: string }> = []
+          for (const message of list) {
+            const role = message?.role === 'assistant' ? 'assistant' : message?.role === 'user' ? 'user' : null
+            if (role === null) continue
+            const parts = Array.isArray(message.content) ? message.content : []
+            const text = parts
+              .filter((part: any) => part?.type === 'text' && typeof part.text === 'string')
+              .map((part: any) => part.text)
+              .join('\n')
+              .trim()
+            if (text.length === 0) continue
+            // 跳过宿主注入的环境上下文（`<system-reminder>` 那段 AGENTS.md 提醒之类）——
+            // 它是给模型的，不该出现在用户的对话栏里。
+            if (text.startsWith('<system-reminder')) continue
+            out.push({ role, text })
+          }
+          sendJson(res, 200, { ok: true, total: out.length, messages: out.slice(-limit) })
+        } catch (error: any) {
+          sendJson(res, 500, { error: error?.message ?? String(error) })
+        }
+      },
+    }),
+  )
+
   console.log(
     '[readnote] host 端点已注册:',
     LIST_PATH,
@@ -724,6 +788,7 @@ export function apply(ctx: any): void {
     NOTES_SAVE_PATH,
     ASK_PATH,
     ANSWER_PATH,
+    MESSAGES_PATH,
     DIAG_PATH,
   )
 }

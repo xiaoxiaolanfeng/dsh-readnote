@@ -24,13 +24,14 @@ const NOTES_READ_PATH = '/__readnote/notes'
 const NOTES_SAVE_PATH = '/__readnote/notes/save'
 const ASK_PATH = '/__readnote/ask'
 const ANSWER_PATH = '/__readnote/last-answer'
+const MESSAGES_PATH = '/__readnote/messages'
 const HIGHLIGHT_NAME = 'readnote-notes'
 
 /**
  * 版本标记：每次改 client 就递增。
  * 用途是排查「改了代码但行为没变」—— 先确认浏览器到底加载了哪一版。
  */
-const BUILD_TAG = 'r18'
+const BUILD_TAG = 'r19'
 
 /** 样式走 dsh 的主题 token，跟宿主保持一致的外观。 */
 const STYLES = `
@@ -58,6 +59,34 @@ const STYLES = `
 .readnote__btn[disabled] { opacity: .35; cursor: default; }
 .readnote__main { flex: 1; min-height: 0; display: flex; }
 .readnote__body { flex: 1; min-height: 0; overflow: auto; }
+
+/* 右侧对话栏 —— 边读边看回答，不用切页签 */
+.readnote__chat {
+  flex: none; width: 340px; min-width: 0;
+  display: flex; flex-direction: column;
+  border-left: 1px solid var(--dsw-alias-border-inverted, rgba(255,255,255,.08));
+  background: var(--dsw-alias-bg-base, rgba(0,0,0,.12));
+}
+.readnote__chat-head {
+  flex: none; display: flex; align-items: center; gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--dsw-alias-border-inverted, rgba(255,255,255,.08));
+  font-size: 11px; letter-spacing: .04em; opacity: .55;
+}
+.readnote__chat-list { flex: 1; min-height: 0; overflow: auto; padding: 10px 12px 16px; }
+.readnote__msg { margin-bottom: 12px; font-size: 12px; line-height: 1.65; }
+.readnote__msg-who { margin: 0 0 3px; font-size: 10px; letter-spacing: .04em; opacity: .4; }
+.readnote__msg-body {
+  padding: 8px 10px; border-radius: 10px;
+  background: var(--dsw-alias-interactive-bg-hover, rgba(255,255,255,.05));
+  word-break: break-word;
+}
+.readnote__msg--user .readnote__msg-body {
+  background: var(--dsw-alias-button-primary-fill, #4c8dff);
+  color: var(--dsw-alias-label-primary-foreground, #fff);
+  margin-left: 28px;
+}
+.readnote__chat-empty { padding: 18px 4px; font-size: 12px; line-height: 1.7; opacity: .45; }
 .readnote__doc { position: relative; max-width: 74ch; margin: 0 auto; padding: 28px 32px 80px; }
 .readnote__list { max-width: 74ch; margin: 0 auto; padding: 14px 24px 60px; }
 .readnote__hint { margin: 0 0 14px; font-size: 13px; opacity: .6; }
@@ -306,6 +335,10 @@ interface Copy {
   sentToChat: string
   pin: string
   recent: string
+  chat: string
+  chatEmpty: string
+  you: string
+  ai: string
 }
 
 /**
@@ -321,7 +354,8 @@ function copy(): Copy {
         reload: '刷新', empty: '这个目录里没有可读的文件', loading: '加载中…',
         save: '保存', cancel: '取消', placeholder: '写点什么…（可留空，仅做标记）',
         notes: '批注', remove: '删除', markOnly: '仅标记（无文字）',
-        ask: '问 AI', sentToChat: '已发进对话 —— 切到「对话」页签看回答', pin: '钉回答', recent: '最近打开',
+        ask: '问 AI', sentToChat: '已发进对话', pin: '钉回答', recent: '最近打开',
+        chat: '对话', chatEmpty: '还没有对话 —— 选中一段文字点「问 AI」，回答会出现在这里。', you: '我', ai: 'AI',
       }
     : {
         label: 'Read', workspace: 'Workspace', pick: 'Pick a markdown file to read', back: '← Back to list',
@@ -329,7 +363,8 @@ function copy(): Copy {
         reload: 'Reload', empty: 'Nothing readable in this folder', loading: 'Loading…',
         save: 'Save', cancel: 'Cancel', placeholder: 'Write something… (empty = just mark it)',
         notes: 'Notes', remove: 'Remove', markOnly: 'Marker only',
-        ask: 'Ask AI', sentToChat: 'Sent into the chat — switch to the Chat tab for the answer', pin: 'Pin answer', recent: 'Recent',
+        ask: 'Ask AI', sentToChat: 'Sent into the chat', pin: 'Pin answer', recent: 'Recent',
+        chat: 'Chat', chatEmpty: 'No conversation yet — select text and hit "Ask AI"; the answer lands here.', you: 'You', ai: 'AI',
       }
 }
 
@@ -565,6 +600,7 @@ loader?.load({
       /** 最后一次提问用的锚点 —— 「钉」要把回答钉回**当时问的那段话**，而不是重新划一次。 */
       const [lastAsked, setLastAsked] = useState<NoteAnchor | null>(null)
       const [recent, setRecent] = useState<RecentEntry[]>(() => lsGet<RecentEntry[]>(LS_RECENT, []))
+      const [messages, setMessages] = useState<Array<{ role: string; text: string }>>([])
 
       const docRef = useRef<HTMLDivElement | null>(null)
       /** 每条批注气泡相对 .readnote__doc 的落点（向左时靠 translateX(-100%) 对齐）。 */
@@ -771,6 +807,32 @@ loader?.load({
           .catch((e: unknown) => setError(`ask error: ${String(e)}`))
           .finally(() => setBusy(false))
       }
+
+      /**
+       * 右侧对话栏的数据：轮询当前会话最近的消息。
+       * 只在「正打开着一篇文档」时轮询 —— 没在读书的时候没必要打扰宿主。
+       * 轮询失败静默：网络抖一下不该在面板上刷红字。
+       */
+      useEffect(() => {
+        if (doc === null || sessionId === undefined) return
+        let alive = true
+        const tick = (): void => {
+          void post(MESSAGES_PATH, { sessionId, limit: 24 })
+            .then((data) => {
+              if (!alive) return
+              if (data?.ok === true && Array.isArray(data.messages)) setMessages(data.messages)
+            })
+            .catch(() => {
+              // 忽略：下一拍会重试。
+            })
+        }
+        tick()
+        const timer = setInterval(tick, 2000)
+        return () => {
+          alive = false
+          clearInterval(timer)
+        }
+      }, [doc, sessionId])
 
       /**
        * 把会话里最后一条助手回答取回来，填进编辑框交给用户改。
@@ -984,7 +1046,45 @@ loader?.load({
               ),
             )
 
-      return h('div', { className: 'readnote' }, bar, h('div', { className: 'readnote__body' }, body), selBar)
+      const chatPanel = h(
+        'div',
+        { className: 'readnote__chat' },
+        h('div', { className: 'readnote__chat-head' }, `${t.chat} · ${messages.length}`),
+        h(
+          'div',
+          { className: 'readnote__chat-list' },
+          messages.length === 0 ? h('div', { className: 'readnote__chat-empty' }, t.chatEmpty) : null,
+          ...messages.map((message, index) =>
+            h(
+              'div',
+              {
+                key: `${index}-${message.role}`,
+                className: message.role === 'user' ? 'readnote__msg readnote__msg--user' : 'readnote__msg',
+              },
+              h('p', { className: 'readnote__msg-who' }, message.role === 'user' ? t.you : t.ai),
+              h(
+                'div',
+                { className: 'readnote__msg-body' },
+                message.role === 'assistant' && MarkdownText
+                  ? h(MarkdownText, {
+                      text: message.text.slice(0, 6000),
+                      streaming: false,
+                      labels: { code: { copyLabel: t.copyCode, copiedLabel: t.copiedCode } },
+                    })
+                  : message.text.slice(0, 4000),
+              ),
+            ),
+          ),
+        ),
+      )
+
+      return h(
+        'div',
+        { className: 'readnote' },
+        bar,
+        h('div', { className: 'readnote__main' }, h('div', { className: 'readnote__body' }, body), chatPanel),
+        selBar,
+      )
     }
 
     /**
