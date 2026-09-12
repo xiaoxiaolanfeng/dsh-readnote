@@ -42,17 +42,33 @@
 ## 规划
 
 - [x] 设计稿（[DESIGN.md](./DESIGN.md)）
-- [ ] 插件骨架：`conversation.view` 阅读页签
+- [x] 插件骨架：`conversation.view` 阅读页签
 - [ ] markdown 渲染 + 划词
 - [ ] 批注：落成会话事件，重开还在
 - [ ] 问答面板 + 钉成笔记
 
-## 开发方式
+## 开发方式（本机）
 
 ```sh
-# 本仓库挂进 dsh profile（开发用，走 patch 热重载）
-# 见 DESIGN.md 附录
+npm install && npm run build
 ```
+
+插件用**本地绝对路径**挂进 dsh profile（走 patch 热重载，不装包）：
+
+```yaml
+# $DSH_HOME/profiles/web/cordis.patch.yml
+- insert:
+    - id: readnote
+      name: 'D:/aitool/dsh-readnote/lib/index.js'
+      config: {}
+```
+
+改代码 → `npm run build` → **刷新浏览器**即可，**无需重启 dsh**（host 与 client 半边均已验证热生效）。
+
+两条实现约束记在这里，免得以后踩：
+
+- client 的 `ModuleLoader.load({ id })` 必须与 `package.json` 的 `name` 完全一致，否则 client-modules 拒绝挂载
+- `src/client.ts` 不能出现 `import` / `export`，编译后必须保持普通脚本形态
 
 ## License
 

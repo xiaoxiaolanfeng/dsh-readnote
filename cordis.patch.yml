@@ -1,0 +1,14 @@
+# dsh-readnote bundle layer: inserts the plugin row.
+#
+# Loaded when a profile lists this bundle. The row id stays stable so a profile's
+# own cordis.patch.yml can target it by id.
+#
+# 开发期也可以不走 bundle，直接把源码绝对路径 insert 进 profile 的
+# cordis.patch.yml（走 patch 热重载，改完刷新即生效）：
+#   - insert:
+#       - id: readnote
+#         name: 'D:/aitool/dsh-readnote/lib/index.js'
+- insert:
+    - id: readnote
+      name: dsh-readnote
+      config: {}
