@@ -16,8 +16,9 @@
  *   - 单文件有大小上限，避免把浏览器卡死。
  */
 
-import { readdir, readFile, stat } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { homedir } from 'node:os'
 
 /** Loader row id 与包名保持一致，便于 profile patch 按 id 覆盖。 */
 export const name = 'dsh-readnote'
@@ -27,6 +28,19 @@ export const inject = ['webServer', 'connection', 'sessions']
 
 const LIST_PATH = '/__readnote/list'
 const READ_PATH = '/__readnote/read'
+const NOTES_READ_PATH = '/__readnote/notes'
+const NOTES_SAVE_PATH = '/__readnote/notes/save'
+
+/**
+ * 批注库放在工作区里的位置。
+ * 刻意「旁挂」而不是写进 markdown 正文：我们读的很可能是别人仓库里的文件，
+ * 往里写东西会弄脏对方的工作区（本项目自己就是活例子）。
+ */
+const NOTES_DIR = '.readnote'
+const NOTES_FILE = 'annotations.json'
+
+/** 单个文档的批注条数上限，防止畸形数据把库撑爆。 */
+const MAX_NOTES_PER_DOC = 500
 
 /** 单个文件大小上限（2 MB）—— 超过就不往浏览器送。 */
 const MAX_FILE_BYTES = 2 * 1024 * 1024
@@ -104,22 +118,80 @@ function rejectConnectionRequest(connection: any, req: any, res: any): boolean {
 }
 
 /**
- * 从会话记录里取工作目录。字段位置随版本可能不同，逐个候选试。
- * @param session - sessions 服务返回的会话对象。
- * @returns 工作目录绝对路径，取不到返回 null。
+ * 解析会话所属的工作目录。
+ *
+ * 三条路，从快到慢：
+ *   1. 活会话的 header —— 最快，但 `sessions.get()` 按文档只认 **live** 会话，
+ *      隔了天的旧会话拿不到（实测）。
+ *   2. `workspaceRegistry.list()` —— 正规 API，但它是「可选 host 能力」，
+ *      本机 profile 实测 `ctx.get('workspaceRegistry')` 返回 undefined。
+ *   3. 工作区账本文件 —— 最后兜底，见 {@link cwdFromWorkspaceLedger}。
+ *
+ * @param sessions - SessionStore 服务（可为空）。
+ * @param registry - WorkspaceRegistry 服务（可为空）。
+ * @param sessionId - 会话 id。
+ * @returns 绝对路径；三条路都拿不到时返回 null。
  */
-function resolveCwd(session: any): string | null {
-  const candidates = [
+async function resolveCwd(sessions: any, registry: any, sessionId: unknown): Promise<string | null> {
+  if (typeof sessionId !== 'string' || sessionId.length === 0) return null
+
+  const session = sessions?.get?.(sessionId)
+  const direct = [
     session?.cwd,
     session?.header?.cwd,
     session?.sessionHeader?.cwd,
     session?.meta?.cwd,
-    session?.record?.cwd,
-  ]
-  for (const value of candidates) {
-    if (typeof value === 'string' && value.length > 0) return value
+  ].find((value) => typeof value === 'string' && value.length > 0)
+  if (typeof direct === 'string') return direct
+
+  const workspaces = registry?.list?.()
+  if (Array.isArray(workspaces)) {
+    for (const workspace of workspaces) {
+      const ids = workspace?.sessionIds
+      if (!Array.isArray(ids) || !ids.includes(sessionId)) continue
+      if (typeof workspace?.path === 'string' && workspace.path.length > 0) return workspace.path
+    }
   }
-  return null
+
+  return cwdFromWorkspaceLedger(sessionId)
+}
+
+/**
+ * dsh 家目录：环境变量优先，退化到 `~/.dsh`。
+ * @returns $DSH_HOME 的绝对路径。
+ */
+function dshHome(): string {
+  const fromEnv = process.env.DSH_HOME
+  if (typeof fromEnv === 'string' && fromEnv.length > 0) return fromEnv
+  return join(homedir(), '.dsh')
+}
+
+/**
+ * 从 dsh 的工作区账本反查会话所属目录。
+ *
+ * 为什么落到读文件：`workspaceRegistry` 本机实测不可用，而 `sessions.get()`
+ * 只认 live 会话 —— 旧会话两条路都不通，账本是最后的兜底。
+ * 读不到或格式变了都只返回 null：让上层报「找不到工作区」，而不是把插件搞崩。
+ *
+ * @param sessionId - 会话 id。
+ * @returns 工作目录绝对路径；拿不到返回 null。
+ */
+async function cwdFromWorkspaceLedger(sessionId: string): Promise<string | null> {
+  try {
+    const raw = await readFile(join(dshHome(), 'storages', 'workspace.json'), 'utf8')
+    const parsed = JSON.parse(raw) as {
+      tables?: { workspaces?: Record<string, { path?: string; sessionIds?: string[] }> }
+    }
+    const workspaces = parsed?.tables?.workspaces
+    if (workspaces === undefined || workspaces === null) return null
+    for (const entry of Object.values(workspaces)) {
+      if (!Array.isArray(entry?.sessionIds) || !entry.sessionIds.includes(sessionId)) continue
+      if (typeof entry.path === 'string' && entry.path.length > 0) return entry.path
+    }
+    return null
+  } catch {
+    return null
+  }
 }
 
 /**
@@ -133,6 +205,41 @@ function safeResolve(root: string, target: string): string | null {
   const abs = isAbsolute(target) ? resolve(target) : resolve(rootResolved, target)
   if (abs !== rootResolved && !abs.startsWith(rootResolved + sep)) return null
   return abs
+}
+
+/** 批注库的绝对路径。 */
+function notesPath(workspace: string): string {
+  return join(workspace, NOTES_DIR, NOTES_FILE)
+}
+
+/**
+ * 读整个批注库。
+ * 库不存在或损坏时返回空库 —— 批注是附加数据，不该因为它读不出来就让文档打不开。
+ * @param workspace - 工作区根目录。
+ * @returns 文档相对路径 → 批注数组。
+ */
+async function readNotes(workspace: string): Promise<Record<string, unknown[]>> {
+  try {
+    const raw = await readFile(notesPath(workspace), 'utf8')
+    const parsed = JSON.parse(raw) as { docs?: Record<string, unknown[]> }
+    return parsed?.docs ?? {}
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * 写整个批注库。
+ * 先写临时文件再 rename —— 避免进程中途挂掉留下半截 JSON 把整个库读废。
+ * @param workspace - 工作区根目录。
+ * @param docs - 文档相对路径 → 批注数组。
+ */
+async function writeNotes(workspace: string, docs: Record<string, unknown[]>): Promise<void> {
+  await mkdir(join(workspace, NOTES_DIR), { recursive: true })
+  const target = notesPath(workspace)
+  const tmp = `${target}.tmp`
+  await writeFile(tmp, JSON.stringify({ version: 1, docs }, null, 2), 'utf8')
+  await rename(tmp, target)
 }
 
 /**
@@ -187,6 +294,11 @@ export function apply(ctx: any): void {
   const host = ctx.get('webServer')
   const connection = ctx.get('connection')
   const sessions = ctx.get('sessions')
+  // workspaceRegistry 是「可选 host 能力」，所以用 ctx.get 而不是 inject ——
+  // inject 一个不存在的服务会让插件永远停在 pending。
+  const registry = ctx.get('workspaceRegistry')
+
+  console.log('[readnote] services: sessions =', sessions ? 'ok' : 'MISSING', '| workspaceRegistry =', registry ? 'ok' : 'MISSING')
 
   if (!host || typeof host.register !== 'function') {
     console.log('[readnote] webServer 不可用，未注册 host 端点')
@@ -204,24 +316,27 @@ export function apply(ctx: any): void {
           return
         }
         let payload: any = {}
+        let rawBody = ''
         try {
-          const raw = await readBody(req)
-          if (raw) payload = JSON.parse(raw)
+          rawBody = await readBody(req)
+          if (rawBody) payload = JSON.parse(rawBody)
         } catch {
           sendJson(res, 400, { error: 'bad json body' })
           return
         }
+        console.log('[readnote] list raw body =', JSON.stringify(rawBody).slice(0, 300))
 
-        const session = sessions?.get?.(payload?.sessionId)
-        const cwd = resolveCwd(session)
+        const cwd = await resolveCwd(sessions, registry, payload?.sessionId)
         if (cwd === null) {
           // 诊断分支：让前端能直接看到会话对象长什么样，便于定位 cwd 字段。
           sendJson(res, 200, {
             ok: false,
             reason: 'cwd-not-found',
-            hasSessionsService: Boolean(sessions),
-            hasSession: Boolean(session),
-            sessionKeys: session ? Object.keys(session).slice(0, 40) : [],
+            receivedSessionId: payload?.sessionId ?? null,
+            receivedSessionIdType: typeof payload?.sessionId,
+            hasSessions: Boolean(sessions),
+            hasRegistry: Boolean(registry),
+            registryWorkspaces: registry?.list?.()?.length ?? 0,
           })
           return
         }
@@ -256,8 +371,7 @@ export function apply(ctx: any): void {
           return
         }
 
-        const session = sessions?.get?.(payload?.sessionId)
-        const cwd = resolveCwd(session)
+        const cwd = await resolveCwd(sessions, registry, payload?.sessionId)
         if (cwd === null) {
           sendJson(res, 200, { ok: false, reason: 'cwd-not-found' })
           return
@@ -298,5 +412,85 @@ export function apply(ctx: any): void {
     }),
   )
 
-  console.log('[readnote] host 端点已注册:', LIST_PATH, READ_PATH)
+  ctx.effect(() =>
+    host.register({
+      kind: 'exact',
+      path: NOTES_READ_PATH,
+      handler: async (req: any, res: any) => {
+        if (rejectConnectionRequest(connection, req, res)) return
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { error: 'method not allowed' })
+          return
+        }
+        let payload: any = {}
+        try {
+          const raw = await readBody(req)
+          if (raw) payload = JSON.parse(raw)
+        } catch {
+          sendJson(res, 400, { error: 'bad json body' })
+          return
+        }
+
+        const cwd = await resolveCwd(sessions, registry, payload?.sessionId)
+        if (cwd === null) {
+          sendJson(res, 200, { ok: false, reason: 'cwd-not-found' })
+          return
+        }
+
+        const docs = await readNotes(cwd)
+        const doc = typeof payload?.doc === 'string' ? payload.doc : ''
+        sendJson(res, 200, { ok: true, doc, notes: docs[doc] ?? [] })
+      },
+    }),
+  )
+
+  ctx.effect(() =>
+    host.register({
+      kind: 'exact',
+      path: NOTES_SAVE_PATH,
+      handler: async (req: any, res: any) => {
+        if (rejectConnectionRequest(connection, req, res)) return
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { error: 'method not allowed' })
+          return
+        }
+        let payload: any = {}
+        try {
+          const raw = await readBody(req)
+          if (raw) payload = JSON.parse(raw)
+        } catch {
+          sendJson(res, 400, { error: 'bad json body' })
+          return
+        }
+
+        const cwd = await resolveCwd(sessions, registry, payload?.sessionId)
+        if (cwd === null) {
+          sendJson(res, 200, { ok: false, reason: 'cwd-not-found' })
+          return
+        }
+        if (typeof payload?.doc !== 'string' || payload.doc.length === 0) {
+          sendJson(res, 400, { error: 'doc required' })
+          return
+        }
+        if (!Array.isArray(payload?.notes)) {
+          sendJson(res, 400, { error: 'notes must be an array' })
+          return
+        }
+        const notes = payload.notes.slice(0, MAX_NOTES_PER_DOC)
+
+        try {
+          const docs = await readNotes(cwd)
+          // 空数组 = 该文档已无批注，顺手把键删掉，别在库里留空壳。
+          if (notes.length === 0) delete docs[payload.doc]
+          else docs[payload.doc] = notes
+          await writeNotes(cwd, docs)
+          sendJson(res, 200, { ok: true, count: notes.length })
+        } catch (error: any) {
+          sendJson(res, 500, { error: error?.message ?? String(error) })
+        }
+      },
+    }),
+  )
+
+  console.log('[readnote] host 端点已注册:', LIST_PATH, READ_PATH, NOTES_READ_PATH, NOTES_SAVE_PATH)
 }

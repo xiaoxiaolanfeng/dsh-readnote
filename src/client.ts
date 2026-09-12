@@ -20,13 +20,15 @@ interface ModuleLoaderDef {
 const STYLE_ID = 'readnote-style'
 const LIST_PATH = '/__readnote/list'
 const READ_PATH = '/__readnote/read'
+const NOTES_READ_PATH = '/__readnote/notes'
+const NOTES_SAVE_PATH = '/__readnote/notes/save'
 const HIGHLIGHT_NAME = 'readnote-notes'
 
 /**
  * 版本标记：每次改 client 就递增。
  * 用途是排查「改了代码但行为没变」—— 先确认浏览器到底加载了哪一版。
  */
-const BUILD_TAG = 'r7'
+const BUILD_TAG = 'r14'
 
 /** 样式走 dsh 的主题 token，跟宿主保持一致的外观。 */
 const STYLES = `
@@ -51,8 +53,9 @@ const STYLES = `
 }
 .readnote__btn:hover { background: var(--dsw-alias-interactive-bg-hover, rgba(255,255,255,.08)); opacity: 1; }
 .readnote__btn[disabled] { opacity: .35; cursor: default; }
+.readnote__main { flex: 1; min-height: 0; display: flex; }
 .readnote__body { flex: 1; min-height: 0; overflow: auto; }
-.readnote__doc { max-width: 74ch; margin: 0 auto; padding: 28px 32px 80px; }
+.readnote__doc { position: relative; max-width: 74ch; margin: 0 auto; padding: 28px 32px 80px; }
 .readnote__list { max-width: 74ch; margin: 0 auto; padding: 14px 24px 60px; }
 .readnote__hint { margin: 0 0 14px; font-size: 13px; opacity: .6; }
 .readnote__crumbs {
@@ -126,11 +129,26 @@ const STYLES = `
 .readnote-sel__cancel:hover { background: var(--dsw-alias-interactive-bg-hover, rgba(255,255,255,.08)); opacity: 1; }
 
 /* 批注列表 */
-.readnote__notes {
-  flex: none; max-height: 30%; overflow: auto;
-  border-top: 1px solid var(--dsw-alias-border-inverted, rgba(255,255,255,.08));
-  padding: 10px 16px 14px;
+/* 批注气泡：挂在高亮文字的旁边，左/右择空 */
+.readnote-bubble {
+  position: absolute; z-index: 5;
+  display: flex; align-items: flex-start; gap: 3px;
+  max-width: 230px; padding: 6px 6px 6px 9px;
+  border: 1px solid rgba(255, 214, 102, .38);
+  border-radius: 9px;
+  background: rgba(255, 214, 102, .13);
+  color: var(--dsw-alias-label-primary, #f5f5f7);
+  font-family: var(--dsw-font-family, system-ui);
+  font-size: 12px; line-height: 1.55;
+  white-space: pre-wrap; word-break: break-word;
 }
+.readnote-bubble__text { flex: 1; min-width: 0; }
+.readnote-bubble__empty { opacity: .5; }
+.readnote-bubble__del {
+  flex: none; border: none; background: transparent; color: inherit;
+  opacity: .4; cursor: pointer; font-size: 11px; line-height: 1; padding: 0 2px;
+}
+.readnote-bubble__del:hover { opacity: .95; }
 .readnote__notes-title { margin: 0 0 8px; font-size: 11px; letter-spacing: .04em; opacity: .45; }
 .readnote__note {
   display: flex; gap: 8px; align-items: flex-start;
@@ -212,6 +230,7 @@ interface Copy {
   placeholder: string
   notes: string
   remove: string
+  markOnly: string
 }
 
 /**
@@ -226,14 +245,14 @@ function copy(): Copy {
         copyCode: '复制', copiedCode: '已复制',
         reload: '刷新', empty: '这个目录里没有可读的文件', loading: '加载中…',
         save: '保存', cancel: '取消', placeholder: '写点什么…（可留空，仅做标记）',
-        notes: '批注', remove: '删除',
+        notes: '批注', remove: '删除', markOnly: '仅标记（无文字）',
       }
     : {
         label: 'Read', workspace: 'Workspace', pick: 'Pick a markdown file to read', back: '← Back to list',
         copyCode: 'Copy', copiedCode: 'Copied',
         reload: 'Reload', empty: 'Nothing readable in this folder', loading: 'Loading…',
         save: 'Save', cancel: 'Cancel', placeholder: 'Write something… (empty = just mark it)',
-        notes: 'Notes', remove: 'Remove',
+        notes: 'Notes', remove: 'Remove', markOnly: 'Marker only',
       }
 }
 
@@ -346,6 +365,7 @@ loader?.load({
      * @returns 解析后的响应体。
      */
     async function post(path: string, payload: unknown): Promise<any> {
+      console.log('[readnote] POST', path, JSON.stringify(payload))
       const res = await fetch(path, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -396,6 +416,15 @@ loader?.load({
     function ReadnoteView(props: { sessionId?: string }): unknown {
       const t = copy()
       const sessionId = props?.sessionId
+      const loggedProps = useRef(false)
+      if (!loggedProps.current) {
+        loggedProps.current = true
+        console.log('[readnote] slot props keys =', Object.keys(props ?? {}))
+        console.log('[readnote] sessionId =', String(sessionId))
+        // 探测工作区能力：sessions.get() 只认「活会话」，所以工作区得从 props 拿。
+        console.log('[readnote] useWorkspaces type =', typeof (props as any)?.useWorkspaces)
+        console.log('[readnote] useSessions type =', typeof (props as any)?.useSessions)
+      }
 
       const [cwd, setCwd] = useState('')
       const [entries, setEntries] = useState<DirEntry[] | null>(null)
@@ -407,6 +436,8 @@ loader?.load({
       const [notes, setNotes] = useState<Note[]>([])
 
       const docRef = useRef<HTMLDivElement | null>(null)
+      /** 每条批注气泡相对 .readnote__doc 的落点（向左时靠 translateX(-100%) 对齐）。 */
+      const [boxes, setBoxes] = useState<Array<{ note: Note; left: number; top: number; side: 'right' | 'left' }>>([])
 
       const loadDir = (rel: string): void => {
         if (sessionId === undefined) {
@@ -423,6 +454,7 @@ loader?.load({
             } else {
               setError(
                 `list failed: ${data?.reason ?? data?.error ?? 'unknown'}\n` +
+                  `receivedSessionId=${String(data?.receivedSessionId)} (${String(data?.receivedSessionIdType)})\n` +
                   `hasSessionsService=${String(data?.hasSessionsService)} hasSession=${String(data?.hasSession)}\n` +
                   `sessionKeys=${JSON.stringify(data?.sessionKeys ?? [])}`,
               )
@@ -438,9 +470,20 @@ loader?.load({
         setPending(null)
         setNotes([])
         void post(READ_PATH, { sessionId, path: entry.path })
-          .then((data) => {
-            if (data?.ok) setDoc({ name: data.name ?? entry.name, content: data.content ?? '', size: data.size ?? entry.size })
-            else setError(`read failed: ${data?.error ?? data?.reason ?? 'unknown'}`)
+          .then(async (data) => {
+            if (!data?.ok) {
+              setError(`read failed: ${data?.error ?? data?.reason ?? 'unknown'}`)
+              return
+            }
+            const name = data.name ?? entry.name
+            setDoc({ name, content: data.content ?? '', size: data.size ?? entry.size })
+            // 批注跟着文档走：打开时把这篇已有的批注一起取回来。
+            try {
+              const saved = await post(NOTES_READ_PATH, { sessionId, doc: name })
+              if (saved?.ok && Array.isArray(saved.notes)) setNotes(saved.notes as Note[])
+            } catch {
+              // 批注取不到不影响阅读，静默降级成「这篇没有批注」。
+            }
           })
           .catch((e: unknown) => setError(`read error: ${String(e)}`))
           .finally(() => setBusy(false))
@@ -486,15 +529,63 @@ loader?.load({
         return () => registry.delete(HIGHLIGHT_NAME)
       }, [notes, doc])
 
+      /**
+       * 把每条批注摆到它高亮文字的旁边。
+       * 坐标相对 .readnote__doc（它是 position: relative 的定位上下文），
+       * 所以父级滚动时气泡自然跟随，不必监听 scroll。
+       */
+      useEffect(() => {
+        const docEl = docRef.current
+        if (docEl === null || notes.length === 0) {
+          setBoxes([])
+          return
+        }
+        const docRect = docEl.getBoundingClientRect()
+        const next: Array<{ note: Note; left: number; top: number; side: 'right' | 'left' }> = []
+        for (const note of notes) {
+          const range = locateRange(docEl, note.anchor)
+          if (range === null) continue
+          const rects = Array.from(range.getClientRects())
+          if (rects.length === 0) continue
+          const first = rects[0]
+          // 右侧放得下就挂右边，否则挂左边。
+          const spaceRight = docEl.clientWidth - (first.right - docRect.left)
+          const side: 'right' | 'left' = spaceRight > 250 ? 'right' : 'left'
+          next.push({
+            note,
+            top: first.top - docRect.top,
+            left: side === 'right' ? first.right - docRect.left + 10 : first.left - docRect.left - 10,
+            side,
+          })
+        }
+        setBoxes(next)
+      }, [notes, doc])
+
+      /**
+       * 把批注写回工作区。
+       * 失败只记日志、不回滚本地状态 —— 让用户继续写，比为了强一致把界面弹回去友好。
+       * @param next - 该文档的完整批注数组。
+       * @param docName - 文档相对工作区的路径（批注库的键）。
+       */
+      const persistNotes = (next: Note[], docName: string): void => {
+        void post(NOTES_SAVE_PATH, { sessionId, doc: docName, notes: next })
+          .then((data) => {
+            if (!data?.ok) console.warn('[readnote] save notes failed', data)
+          })
+          .catch((e: unknown) => console.warn('[readnote] save notes error', e))
+      }
+
       const saveNote = (): void => {
-        if (pending === null) return
+        if (pending === null || doc === null) return
         const note: Note = {
           id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           anchor: pending.anchor,
           text: draft.trim(),
           createdAt: Date.now(),
         }
-        setNotes([...notes, note])
+        const next = [...notes, note]
+        setNotes(next)
+        persistNotes(next, doc.name)
         setPending(null)
         setDraft('')
         window.getSelection()?.removeAllRanges()
@@ -512,6 +603,7 @@ loader?.load({
         h('span', { className: 'readnote__name' }, doc ? doc.name : t.pick),
         doc ? h('span', { className: 'readnote__meta' }, humanSize(doc.size)) : null,
         h('span', { className: 'readnote__spacer' }),
+        doc !== null && notes.length > 0 ? h('span', { className: 'readnote__meta' }, `${t.notes} ${notes.length}`) : null,
         h('span', { className: 'readnote__meta', title: 'client build tag' }, BUILD_TAG),
         busy ? h('span', { className: 'readnote__meta' }, t.loading) : null,
         doc
@@ -548,6 +640,43 @@ loader?.load({
                   labels: { code: { copyLabel: t.copyCode, copiedLabel: t.copiedCode } },
                 })
               : h('pre', null, text),
+          ),
+          // 批注气泡层：绝对定位在 .readnote__doc 内，直接挂在高亮文字旁边。
+          ...boxes.map(({ note, left, top, side }) =>
+            h(
+              'div',
+              {
+                key: note.id,
+                className: 'readnote-bubble',
+                style: {
+                  left: `${left}px`,
+                  top: `${top}px`,
+                  transform: side === 'left' ? 'translateX(-100%)' : undefined,
+                },
+              },
+              h(
+                'div',
+                {
+                  className:
+                    note.text.length === 0 ? 'readnote-bubble__text readnote-bubble__empty' : 'readnote-bubble__text',
+                },
+                note.text.length > 0 ? note.text : t.markOnly,
+              ),
+              h(
+                'button',
+                {
+                  className: 'readnote-bubble__del',
+                  type: 'button',
+                  title: t.remove,
+                  onClick: () => {
+                    const next = notes.filter((n) => n.id !== note.id)
+                    setNotes(next)
+                    if (doc !== null) persistNotes(next, doc.name)
+                  },
+                },
+                '✕',
+              ),
+            ),
           ),
         )
       } else {
@@ -618,38 +747,7 @@ loader?.load({
               ),
             )
 
-      const notesPanel =
-        doc === null || notes.length === 0
-          ? null
-          : h(
-              'div',
-              { className: 'readnote__notes' },
-              h('p', { className: 'readnote__notes-title' }, `${t.notes} · ${notes.length}`),
-              ...notes.map((note) =>
-                h(
-                  'div',
-                  { key: note.id, className: 'readnote__note' },
-                  h('span', { className: 'readnote__note-quote' }, '▍'),
-                  h(
-                    'span',
-                    { className: 'readnote__note-text' },
-                    note.text.length > 0 ? note.text : `（${note.anchor.quote.slice(0, 40)}）`,
-                  ),
-                  h(
-                    'button',
-                    {
-                      className: 'readnote__note-del',
-                      type: 'button',
-                      title: t.remove,
-                      onClick: () => setNotes(notes.filter((n) => n.id !== note.id)),
-                    },
-                    '✕',
-                  ),
-                ),
-              ),
-            )
-
-      return h('div', { className: 'readnote' }, bar, h('div', { className: 'readnote__body' }, body), notesPanel, selBar)
+      return h('div', { className: 'readnote' }, bar, h('div', { className: 'readnote__body' }, body), selBar)
     }
 
     /**

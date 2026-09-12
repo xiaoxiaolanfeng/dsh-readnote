@@ -312,6 +312,28 @@ I.memo(function({ text: r, streaming: i = !1, labels: s, fileMentions: a, pathIm
 > 附带一条：`dsh-client-ui-primitives` 在 `node_modules` 里**根本不存在** ——
 > 它是 `PLATFORM_MODULES` 里 shell 静态打入的，所以"找包看源码"这条路从一开始就不通。
 
+### 4.8 宿主安全类（插件能把 dsh 拖挂）
+
+| 现象 | 原因 | 解法 |
+|---|---|---|
+| **改完代码，整个 dsh 实例连不上（`ERR_CONNECTION_REFUSED`）** | TypeScript 编译报错（`replace_all` 漏了两处调用），**但 tsc 默认仍然 emit** → `lib/index.js` 被写成带 `ReferenceError` 的坏产物 → dsh 热重载装进去 → 插件加载即抛错 → 实例挂掉 | tsconfig 加 **`noEmitOnError: true`**：编译失败就不产出，旧的可跑版本继续服务，而不是把宿主一起带下水 |
+
+**这条和「不改 dsh 原生文件」是两件事。** 我们确实一行都没碰 dsh 的安装目录（插件全程靠 patch 挂载），
+但**插件自身的崩溃同样能拖垮宿主** —— 因为它进了 profile，就是宿主进程的一部分。
+
+> **写插件时，代码质量的下限不是「我的功能能不能用」，而是「我崩了会不会带上整个宿主」。**
+> 构建产物必须是「要么正确，要么不更新」，绝不能出现「更新了一份错的」。
+
+### 4.9 「活会话」陷阱（服务可用 ≠ 数据可查）
+
+| 现象 | 原因 | 解法 |
+|---|---|---|
+| **打开很久没碰的旧会话 → 阅读页签报 `cwd-not-found`** | `SessionStore.get()` 的文档原文是 *"Look up a **live** session … undefined when **no live session** has that id"* —— store 里只放当前进程内活着的会话。刚交互过的会话查得到，**隔天的旧会话查不到** | 别把「拿工作目录」绑在会话生命周期上。铺三条路：活会话 header → `workspaceRegistry.list()` → 读 `$DSH_HOME/storages/workspace.json` 账本兜底 |
+| **同一个服务，`ctx.get()` 前面拿不到、后面拿得到** | `workspaceRegistry` 是**懒发布**的可选能力，要等 `storageDomain` + `sessionPersistence` 就绪 | 别在 `apply()` 阶段 `ctx.get()` 定值 —— 那是启动最早期。在 handler 里按需取。（也不能改用 `inject`：inject 一个不存在的服务会让插件永远 pending） |
+
+> **「服务拿到了」和「数据能查到」是两件事。** 前者是依赖注入的时序，后者是业务生命周期 ——
+> 把两者混在一起设计接口，就会得到一个「上个厕所回来就打不开」的功能。
+
 ---
 
 ## 五、最终开发工作流（两条都不用重启 dsh）
