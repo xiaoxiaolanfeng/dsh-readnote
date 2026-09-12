@@ -312,6 +312,31 @@ I.memo(function({ text: r, streaming: i = !1, labels: s, fileMentions: a, pathIm
 > 附带一条：`dsh-client-ui-primitives` 在 `node_modules` 里**根本不存在** ——
 > 它是 `PLATFORM_MODULES` 里 shell 静态打入的，所以"找包看源码"这条路从一开始就不通。
 
+**事后验证（拉对了版本之后）**：上面这个结论**一字不差地成立**。
+
+```
+旧 clone  dsh-v0.1.0-rc.8  render.tsx:326  copyLabel={context.codeLabels?.copyLabel}
+新源码    dsh-v0.1.5-rc.1  render.tsx:395  copyLabel={context.labels.code.copyLabel}
+新源码    MarkdownText props: { text, streaming?, labels: MarkdownLabels, ... }   ← labels 必填
+```
+
+也就是说：**在源码版本错的情况下，靠读 dist 得出的根因仍然是对的** —— 这条方法论经受住了事后验证。
+
+### 4.12 源码版本必须钉住（本项目的踩坑前提）
+
+| 事实 | 值 |
+|---|---|
+| 本机运行的 dsh | `0.1.5-rc.1` |
+| 查运行行为要用的源码 | `D:\aitool\myself\temp\deepseek-harness-0151`（tag `dsh-v0.1.5-rc.1`，浅克隆） |
+| 旧的源码 clone | `D:\aitool\myself\temp\deepseek-harness`（tag `dsh-v0.1.0-rc.8`）—— **只对应早期文章，不要用它推断运行行为** |
+
+**为什么专门记这一条**：本手记里 4.7 那三次猜错，根因就是照着 `rc.8` 的源码去推断 `rc.1` 的运行行为。
+**中间差 5 个 rc 版本**，API 形状会变（`codeLabels` → `labels` 就是活例）。
+
+> **排查框架行为之前，第一件事是确认「我读的源码是不是跑着的那个版本」。**
+> 一条命令就能确认：`git -C <clone> describe --tags` vs 安装包的 `version` 字段。
+> 如果对不上，要么拉对版本，要么直接读构建产物 —— **别在错版本的源码里找答案**。
+
 ### 4.8 宿主安全类（插件能把 dsh 拖挂）
 
 | 现象 | 原因 | 解法 |

@@ -32,6 +32,16 @@
 | `BUILDING.md` | 构建手记：技术取舍、dsh 机制、踩坑清单、面试素材 | **遇到问题就更新**（见上） |
 | `README.md` | 对外说明 + 规划清单 | 完成一个里程碑时勾掉对应项 |
 
+## 查 dsh 源码时用哪一份（重要）
+
+| 用途 | 路径 | 版本 |
+|---|---|---|
+| **推断运行行为**（唯一可信） | `D:\aitool\myself\temp\deepseek-harness-0151` | `dsh-v0.1.5-rc.1`，与本机安装版一致 |
+| 查早期文章相关内容 | `D:\aitool\myself\temp\deepseek-harness` | `dsh-v0.1.0-rc.8`，**落后 5 个 rc，不可用来推断运行行为** |
+
+**动源码前先对版本**：`git -C <clone> describe --tags` ↔ 安装包 `node_modules/@deepseek-ai/dsh/package.json` 的 `version`。
+对不上就别在源码里找答案——直接读构建产物（浏览器报错信息里有文件名和行列号）。
+
 ## 开发工作流提醒
 
 ```sh
