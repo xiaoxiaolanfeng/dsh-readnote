@@ -23,13 +23,14 @@ const READ_PATH = '/__readnote/read'
 const NOTES_READ_PATH = '/__readnote/notes'
 const NOTES_SAVE_PATH = '/__readnote/notes/save'
 const ASK_PATH = '/__readnote/ask'
+const ANSWER_PATH = '/__readnote/last-answer'
 const HIGHLIGHT_NAME = 'readnote-notes'
 
 /**
  * 版本标记：每次改 client 就递增。
  * 用途是排查「改了代码但行为没变」—— 先确认浏览器到底加载了哪一版。
  */
-const BUILD_TAG = 'r15'
+const BUILD_TAG = 'r17'
 
 /** 样式走 dsh 的主题 token，跟宿主保持一致的外观。 */
 const STYLES = `
@@ -39,6 +40,7 @@ const STYLES = `
   color: var(--dsw-alias-label-primary, #f5f5f7);
 }
 .readnote__bar {
+  position: relative; z-index: 20;   /* 压过 dsh 的右缘宽度拖拽手柄，否则右侧按钮点不到 */
   display: flex; align-items: center; gap: 10px; flex: none;
   min-height: 44px; padding: 0 16px;
   border-bottom: 1px solid var(--dsw-alias-border-inverted, rgba(255,255,255,.08));
@@ -242,6 +244,7 @@ interface Copy {
   markOnly: string
   ask: string
   sentToChat: string
+  pin: string
 }
 
 /**
@@ -257,7 +260,7 @@ function copy(): Copy {
         reload: '刷新', empty: '这个目录里没有可读的文件', loading: '加载中…',
         save: '保存', cancel: '取消', placeholder: '写点什么…（可留空，仅做标记）',
         notes: '批注', remove: '删除', markOnly: '仅标记（无文字）',
-        ask: '问 AI', sentToChat: '已发进对话 —— 切到「对话」页签看回答',
+        ask: '问 AI', sentToChat: '已发进对话 —— 切到「对话」页签看回答', pin: '钉回答',
       }
     : {
         label: 'Read', workspace: 'Workspace', pick: 'Pick a markdown file to read', back: '← Back to list',
@@ -265,7 +268,7 @@ function copy(): Copy {
         reload: 'Reload', empty: 'Nothing readable in this folder', loading: 'Loading…',
         save: 'Save', cancel: 'Cancel', placeholder: 'Write something… (empty = just mark it)',
         notes: 'Notes', remove: 'Remove', markOnly: 'Marker only',
-        ask: 'Ask AI', sentToChat: 'Sent into the chat — switch to the Chat tab for the answer',
+        ask: 'Ask AI', sentToChat: 'Sent into the chat — switch to the Chat tab for the answer', pin: 'Pin answer',
       }
 }
 
@@ -450,6 +453,8 @@ loader?.load({
       const [draft, setDraft] = useState('')
       const [notes, setNotes] = useState<Note[]>([])
       const [notice, setNotice] = useState('')
+      /** 最后一次提问用的锚点 —— 「钉」要把回答钉回**当时问的那段话**，而不是重新划一次。 */
+      const [lastAsked, setLastAsked] = useState<NoteAnchor | null>(null)
 
       const docRef = useRef<HTMLDivElement | null>(null)
       /** 每条批注气泡相对 .readnote__doc 的落点（向左时靠 translateX(-100%) 对齐）。 */
@@ -622,6 +627,7 @@ loader?.load({
           .then((data) => {
             if (data?.ok) {
               setNotice(t.sentToChat)
+              setLastAsked(pending.anchor)
               setPending(null)
               setDraft('')
               window.getSelection()?.removeAllRanges()
@@ -634,11 +640,34 @@ loader?.load({
           .finally(() => setBusy(false))
       }
 
+      /**
+       * 把会话里最后一条助手回答取回来，填进编辑框交给用户改。
+       * 「先看能改」是设计稿写死的硬约束 —— 这里只取原料，落不落成笔记由用户点保存决定。
+       */
+      const pinAnswer = (): void => {
+        if (lastAsked === null || doc === null || sessionId === undefined) return
+        setBusy(true)
+        setError(null)
+        setNotice('')
+        void post(ANSWER_PATH, { sessionId })
+          .then((data) => {
+            if (data?.ok === true && typeof data.text === 'string') {
+              setDraft(data.text.slice(0, 2000))
+              setPending({ anchor: lastAsked, x: Math.round(window.innerWidth / 2) - 150, y: 140 })
+            } else {
+              setNotice(data?.message ?? '没找到助手回答')
+            }
+          })
+          .catch((e: unknown) => setError(`pin error: ${String(e)}`))
+          .finally(() => setBusy(false))
+      }
+
       const backToDir = (): void => {
         setDoc(null)
         setNotes([])
         setPending(null)
         setNotice('')
+        setLastAsked(null)
       }
 
       const bar = h(
@@ -646,6 +675,10 @@ loader?.load({
         { className: 'readnote__bar' },
         h('span', { className: 'readnote__name' }, doc ? doc.name : t.pick),
         doc ? h('span', { className: 'readnote__meta' }, humanSize(doc.size)) : null,
+        // 「钉回答」放左侧：右缘被 dsh 的宽度拖拽手柄覆盖，放那儿点不到（实测）。
+        doc !== null && lastAsked !== null
+          ? h('button', { className: 'readnote__btn', type: 'button', onClick: pinAnswer, disabled: busy }, `✨ ${t.pin}`)
+          : null,
         h('span', { className: 'readnote__spacer' }),
         notice.length > 0 ? h('span', { className: 'readnote__notice' }, notice) : null,
         doc !== null && notes.length > 0 ? h('span', { className: 'readnote__meta' }, `${t.notes} ${notes.length}`) : null,

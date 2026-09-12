@@ -358,6 +358,15 @@ report._agentIds = agents.list().map(a => ({ id: a.id, keys: Object.keys(a).slic
 > **想替用户做一件事之前，先问清楚「这件事依赖的那个东西，什么时候存在」。**
 > dsh 里 session / agent / workspace 三者各有各的生命周期，把它们当成「一直都在」是这类插件最容易踩的坑。
 
+### 4.11 点不到的按钮（宿主 UI 会盖住你）
+
+| 现象 | 原因 | 解法 |
+|---|---|---|
+| **顶栏右侧的按钮点不动**（Playwright 报 `intercepts pointer events`） | dsh 有一个 **右缘面板宽度拖拽手柄**（`div[data-side="right"][data-width-handle="right"]`），它盖在最右侧一条竖带上。顶栏右上角的按钮正好落在它下面 | ① 给顶栏加 `position: relative; z-index: 20` 压过它；② **更重要的是把交互按钮挪离右缘**（放文件名旁边）——只靠 z-index 是在跟宿主抢层级，位置才是根本解 |
+
+> 这条只有真去点才会发现：**DOM 里在、视觉上在、`count() > 0`，就是点不到。**
+> 自己用 Playwright 跑一遍点击，比看截图可靠得多 —— 截图看不出"谁能接到 pointer events"。
+
 ---
 
 ## 五、最终开发工作流（两条都不用重启 dsh）

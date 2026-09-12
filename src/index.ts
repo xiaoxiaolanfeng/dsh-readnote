@@ -32,6 +32,7 @@ const NOTES_READ_PATH = '/__readnote/notes'
 const NOTES_SAVE_PATH = '/__readnote/notes/save'
 const DIAG_PATH = '/__readnote/diag'
 const ASK_PATH = '/__readnote/ask'
+const ANSWER_PATH = '/__readnote/last-answer'
 
 /**
  * 批注库放在工作区里的位置。
@@ -652,6 +653,69 @@ export function apply(ctx: any): void {
     }),
   )
 
+  // 「钉」的原料：把会话里最后一条助手回答取出来给前端。
+  //
+  // 为什么不在这里调模型做「提炼」：提炼要再花一次调用，而且用户多半更想自己删减
+  // ——「先看能改」是设计稿写死的硬约束。所以这里只负责**取回原文**，
+  // 前端的编辑框负责提炼，用户点头才落成笔记。
+  ctx.effect(() =>
+    host.register({
+      kind: 'exact',
+      path: ANSWER_PATH,
+      handler: async (req: any, res: any) => {
+        if (rejectConnectionRequest(connection, req, res)) return
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { error: 'method not allowed' })
+          return
+        }
+        let payload: any = {}
+        try {
+          const raw = await readBody(req)
+          if (raw) payload = JSON.parse(raw)
+        } catch {
+          sendJson(res, 400, { error: 'bad json body' })
+          return
+        }
+        const sessionId = payload?.sessionId
+        if (typeof sessionId !== 'string' || sessionId.length === 0) {
+          sendJson(res, 400, { error: 'sessionId required' })
+          return
+        }
+
+        const session = ctx.get('sessions')?.get?.(sessionId)
+        if (session === undefined || session === null || typeof session.deriveMessages !== 'function') {
+          sendJson(res, 200, {
+            ok: false,
+            reason: 'session-not-live',
+            message: '这个会话当前不在内存里（dsh 只为活跃会话保留），先回对话页看一眼再回来钉。',
+          })
+          return
+        }
+
+        try {
+          const messages = session.deriveMessages()
+          const list = Array.isArray(messages) ? messages : []
+          for (let i = list.length - 1; i >= 0; i -= 1) {
+            const message = list[i]
+            if (message?.role !== 'assistant') continue
+            const parts = Array.isArray(message.content) ? message.content : []
+            const text = parts
+              .filter((part: any) => part?.type === 'text' && typeof part.text === 'string')
+              .map((part: any) => part.text)
+              .join('\n')
+              .trim()
+            if (text.length === 0) continue
+            sendJson(res, 200, { ok: true, text, total: list.length })
+            return
+          }
+          sendJson(res, 200, { ok: false, reason: 'no-answer', message: '还没找到助手回答 —— 先在阅读页用「问 AI」提个问。' })
+        } catch (error: any) {
+          sendJson(res, 500, { error: error?.message ?? String(error) })
+        }
+      },
+    }),
+  )
+
   console.log(
     '[readnote] host 端点已注册:',
     LIST_PATH,
@@ -659,6 +723,7 @@ export function apply(ctx: any): void {
     NOTES_READ_PATH,
     NOTES_SAVE_PATH,
     ASK_PATH,
+    ANSWER_PATH,
     DIAG_PATH,
   )
 }
