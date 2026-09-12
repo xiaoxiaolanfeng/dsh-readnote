@@ -30,7 +30,7 @@ const HIGHLIGHT_NAME = 'readnote-notes'
  * 版本标记：每次改 client 就递增。
  * 用途是排查「改了代码但行为没变」—— 先确认浏览器到底加载了哪一版。
  */
-const BUILD_TAG = 'r17'
+const BUILD_TAG = 'r18'
 
 /** 样式走 dsh 的主题 token，跟宿主保持一致的外观。 */
 const STYLES = `
@@ -65,6 +65,11 @@ const STYLES = `
   display: flex; align-items: center; flex-wrap: wrap; gap: 2px;
   margin: 4px 0 12px; font-size: 12px;
 }
+.readnote__recent {
+  margin-bottom: 14px; padding-bottom: 10px;
+  border-bottom: 1px solid var(--dsw-alias-border-inverted, rgba(255,255,255,.08));
+}
+.readnote__section { margin: 0 0 6px; font-size: 11px; letter-spacing: .04em; opacity: .45; }
 .readnote__crumb {
   border: none; background: transparent; color: inherit;
   font-family: inherit; font-size: 12px; cursor: pointer;
@@ -221,6 +226,61 @@ interface Pending {
 const CONTEXT_CHARS = 32
 
 /**
+ * localStorage 键名（带前缀，避免与宿主或别的插件撞）。
+ * 用 localStorage 而不是服务端：这是「这台机器这个人上次看到哪」的本地状态，
+ * 丢了顶多重新点一次，不值得为它引入一次网络往返。
+ */
+const LS_LAST = 'readnote:last'
+const LS_RECENT = 'readnote:recent'
+
+/** 最近打开最多留几条。 */
+const MAX_RECENT = 8
+
+/** 「上次读到哪儿」。 */
+interface LastState {
+  doc: string
+  dir: string
+}
+
+/** 最近打开的一条。 */
+interface RecentEntry {
+  /** 相对工作区的文档路径。 */
+  doc: string
+  /** 打开它时所在的目录 —— 列表点进去后能回到原来的位置。 */
+  dir: string
+  /** 打开时间（毫秒）。 */
+  at: number
+}
+
+/**
+ * 读 localStorage。任何异常都当没有 —— 隐私模式、配额满、脏数据都不该影响阅读。
+ * @param key - 键名。
+ * @param fallback - 取不到时的默认值。
+ * @returns 解析后的值或默认值。
+ */
+function lsGet<T>(key: string, fallback: T): T {
+  try {
+    const raw = window.localStorage.getItem(key)
+    return raw === null ? fallback : (JSON.parse(raw) as T)
+  } catch {
+    return fallback
+  }
+}
+
+/**
+ * 写 localStorage，失败静默。
+ * @param key - 键名。
+ * @param value - 要序列化的值。
+ */
+function lsSet(key: string, value: unknown): void {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value))
+  } catch {
+    // 配额满或隐私模式：缓存写不进去不是错误，忽略。
+  }
+}
+
+/**
  * 单次渲染的字符上限。
  * 超过就只渲染前一段并提示 —— 超长文档会把主线程堵死（实测踩过：某些文件点开就卡死）。
  */
@@ -245,6 +305,7 @@ interface Copy {
   ask: string
   sentToChat: string
   pin: string
+  recent: string
 }
 
 /**
@@ -260,7 +321,7 @@ function copy(): Copy {
         reload: '刷新', empty: '这个目录里没有可读的文件', loading: '加载中…',
         save: '保存', cancel: '取消', placeholder: '写点什么…（可留空，仅做标记）',
         notes: '批注', remove: '删除', markOnly: '仅标记（无文字）',
-        ask: '问 AI', sentToChat: '已发进对话 —— 切到「对话」页签看回答', pin: '钉回答',
+        ask: '问 AI', sentToChat: '已发进对话 —— 切到「对话」页签看回答', pin: '钉回答', recent: '最近打开',
       }
     : {
         label: 'Read', workspace: 'Workspace', pick: 'Pick a markdown file to read', back: '← Back to list',
@@ -268,7 +329,7 @@ function copy(): Copy {
         reload: 'Reload', empty: 'Nothing readable in this folder', loading: 'Loading…',
         save: 'Save', cancel: 'Cancel', placeholder: 'Write something… (empty = just mark it)',
         notes: 'Notes', remove: 'Remove', markOnly: 'Marker only',
-        ask: 'Ask AI', sentToChat: 'Sent into the chat — switch to the Chat tab for the answer', pin: 'Pin answer',
+        ask: 'Ask AI', sentToChat: 'Sent into the chat — switch to the Chat tab for the answer', pin: 'Pin answer', recent: 'Recent',
       }
 }
 
@@ -406,7 +467,11 @@ loader?.load({
 
     const reactNs = require('react') as Record<string, unknown> | undefined
     const React = (reactNs?.default ?? reactNs) as any
-    const useState = React.useState as <T>(initial: T) => [T, (next: T) => void]
+    // 函数式更新（setX(prev => next)）也要允许 —— 只写 (next: T) => void 会让
+    // 基于前值的更新编不过（踩过）。
+    const useState = React.useState as <T>(
+      initial: T | (() => T),
+    ) => [T, (next: T | ((prev: T) => T)) => void]
     const useEffect = React.useEffect as (fn: () => void | (() => void), deps: unknown[]) => void
     const useRef = React.useRef as <T>(initial: T) => { current: T }
     const h = React.createElement as (type: unknown, props?: unknown, ...children: unknown[]) => unknown
@@ -499,6 +564,7 @@ loader?.load({
       const [notice, setNotice] = useState('')
       /** 最后一次提问用的锚点 —— 「钉」要把回答钉回**当时问的那段话**，而不是重新划一次。 */
       const [lastAsked, setLastAsked] = useState<NoteAnchor | null>(null)
+      const [recent, setRecent] = useState<RecentEntry[]>(() => lsGet<RecentEntry[]>(LS_RECENT, []))
 
       const docRef = useRef<HTMLDivElement | null>(null)
       /** 每条批注气泡相对 .readnote__doc 的落点（向左时靠 translateX(-100%) 对齐）。 */
@@ -529,20 +595,34 @@ loader?.load({
           .finally(() => setBusy(false))
       }
 
-      const openDoc = (entry: DirEntry): void => {
+      /** 记住「上次读到哪儿」并进最近列表 —— 两个需求的写入端。 */
+      const rememberDoc = (docPath: string, dir: string): void => {
+        lsSet(LS_LAST, { doc: docPath, dir } as LastState)
+        setRecent((prev) => {
+          const next: RecentEntry[] = [
+            { doc: docPath, dir, at: Date.now() },
+            ...prev.filter((item) => item.doc !== docPath),
+          ].slice(0, MAX_RECENT)
+          lsSet(LS_RECENT, next)
+          return next
+        })
+      }
+
+      /** 按路径打开文档 —— 目录点击、最近列表、启动恢复都走这里。 */
+      const openDocByPath = (docPath: string, fallbackName: string, dir: string): void => {
         setBusy(true)
         setError(null)
         setPending(null)
         setNotes([])
-        void post(READ_PATH, { sessionId, path: entry.path })
+        void post(READ_PATH, { sessionId, path: docPath })
           .then(async (data) => {
             if (!data?.ok) {
               setError(`read failed: ${data?.error ?? data?.reason ?? 'unknown'}`)
               return
             }
-            const name = data.name ?? entry.name
-            setDoc({ name, content: data.content ?? '', size: data.size ?? entry.size })
-            // 批注跟着文档走：打开时把这篇已有的批注一起取回来。
+            const name = data.name ?? fallbackName
+            setDoc({ name, content: data.content ?? '', size: data.size ?? 0 })
+            rememberDoc(name, dir)
             try {
               const saved = await post(NOTES_READ_PATH, { sessionId, doc: name })
               if (saved?.ok && Array.isArray(saved.notes)) setNotes(saved.notes as Note[])
@@ -554,9 +634,17 @@ loader?.load({
           .finally(() => setBusy(false))
       }
 
+      const openDoc = (entry: DirEntry): void => openDocByPath(entry.path, entry.name, cwd)
+
       useEffect(() => {
-        loadDir('')
-        // 只在会话切换时回到工作区根。
+        // 恢复上次读到哪儿（用户要求：别每次都重新点）。一次 effect 内完成，
+        // 免得「列目录」和「恢复文档」两个异步流程抢 cwd。
+        const last = lsGet<LastState | null>(LS_LAST, null)
+        const dir = last !== null && typeof last.dir === 'string' ? last.dir : ''
+        loadDir(dir)
+        if (last !== null && typeof last.doc === 'string' && last.doc.length > 0) {
+          openDocByPath(last.doc, last.doc, dir)
+        }
       }, [sessionId])
 
       /** 划词：选区落在文档正文里就浮出工具条。 */
@@ -807,6 +895,28 @@ loader?.load({
         body = h(
           'div',
           { className: 'readnote__list' },
+          // 最近打开在每个目录都显示 —— 「返回列表」回到的是文档所在目录，
+          // 只在根显示的话用户永远看不到它（踩过）。
+          recent.length > 0
+            ? h(
+                'div',
+                { className: 'readnote__recent' },
+                h('p', { className: 'readnote__section' }, t.recent),
+                ...recent.map((item) =>
+                  h(
+                    'button',
+                    {
+                      key: `recent-${item.doc}`,
+                      className: 'readnote__item',
+                      type: 'button',
+                      onClick: () => openDocByPath(item.doc, item.doc, item.dir),
+                    },
+                    h('span', { className: 'readnote__item-icon' }, '🕘'),
+                    h('span', { className: 'readnote__item-name' }, item.doc),
+                  ),
+                ),
+              )
+            : null,
           h(
             'div',
             { className: 'readnote__crumbs' },
