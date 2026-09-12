@@ -334,6 +334,30 @@ I.memo(function({ text: r, streaming: i = !1, labels: s, fileMentions: a, pathIm
 > **「服务拿到了」和「数据能查到」是两件事。** 前者是依赖注入的时序，后者是业务生命周期 ——
 > 把两者混在一起设计接口，就会得到一个「上个厕所回来就打不开」的功能。
 
+### 4.10 Agent 生命周期（想「替用户发消息」必读）
+
+| 现象 | 原因 | 解法 |
+|---|---|---|
+| **划词提问永远返回 `agent-not-live`** | `agents.get(sessionId)` 拿不到 agent —— 和 4.9 的 `sessions.get()` 同源：**agent 只在会话「正在工作时」存在**，空闲即释放。实测：发完消息等 6 秒就不在了；`agents.resume(sessionId)` 也拉不回来 | ① 如实告诉用户「先在对话框发一句唤醒它」，而不是静默失败；② 用 `agents.list()` 自查当前到底哪个会话有活 agent |
+
+**排查过程值得记**：我一度以为 `agents.get(sessionId)` 用法错了（因为 agent id 和 session id 看着不像一回事），
+直到打印 `agents.list()` 才看清 —— **`agent.id` 就是 sessionId**，用法没错，
+错的是「我发消息的那个会话根本没有 agent」。
+
+```js
+// 一次查明真相的探测（比读文档快十倍）
+report._agentCount = agents.list().length
+report._agentIds = agents.list().map(a => ({ id: a.id, keys: Object.keys(a).slice(0, 10) }))
+// → [{ id: 'session-0a25c95d-...', keys: ['loopCtx','id','options','session','inbox','phase',...] }]
+```
+
+**顺带摸清了一条正路**：`agent.followup(message)` 确实能把一条用户消息送进会话。
+消息形状是从 `session.deriveMessages()` 里**抄**来的（`{ role, content: [{type:'text',text}], source: {kind:'user'} }`），
+因此**不需要 import `@deepseek-ai/dsh-llm` 的 `createUserMessage`** —— 独立包解析不到 dsh 的 node_modules，这条路本来就走不通。
+
+> **想替用户做一件事之前，先问清楚「这件事依赖的那个东西，什么时候存在」。**
+> dsh 里 session / agent / workspace 三者各有各的生命周期，把它们当成「一直都在」是这类插件最容易踩的坑。
+
 ---
 
 ## 五、最终开发工作流（两条都不用重启 dsh）

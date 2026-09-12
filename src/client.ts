@@ -22,13 +22,14 @@ const LIST_PATH = '/__readnote/list'
 const READ_PATH = '/__readnote/read'
 const NOTES_READ_PATH = '/__readnote/notes'
 const NOTES_SAVE_PATH = '/__readnote/notes/save'
+const ASK_PATH = '/__readnote/ask'
 const HIGHLIGHT_NAME = 'readnote-notes'
 
 /**
  * 版本标记：每次改 client 就递增。
  * 用途是排查「改了代码但行为没变」—— 先确认浏览器到底加载了哪一版。
  */
-const BUILD_TAG = 'r14'
+const BUILD_TAG = 'r15'
 
 /** 样式走 dsh 的主题 token，跟宿主保持一致的外观。 */
 const STYLES = `
@@ -127,6 +128,14 @@ const STYLES = `
   font-family: inherit; font-size: 12px; cursor: pointer;
 }
 .readnote-sel__cancel:hover { background: var(--dsw-alias-interactive-bg-hover, rgba(255,255,255,.08)); opacity: 1; }
+.readnote-sel__ask {
+  height: 28px; padding: 0 14px; border: none; border-radius: 14px;
+  background: transparent; color: inherit;
+  border: 1px solid var(--dsw-alias-border-inverted, rgba(255,255,255,.2));
+  font-family: inherit; font-size: 12px; cursor: pointer; opacity: .9;
+}
+.readnote-sel__ask:hover { background: var(--dsw-alias-interactive-bg-hover, rgba(255,255,255,.08)); opacity: 1; }
+.readnote__notice { color: var(--dsw-alias-label-success, #5fd08a); opacity: .95; }
 
 /* 批注列表 */
 /* 批注气泡：挂在高亮文字的旁边，左/右择空 */
@@ -231,6 +240,8 @@ interface Copy {
   notes: string
   remove: string
   markOnly: string
+  ask: string
+  sentToChat: string
 }
 
 /**
@@ -246,6 +257,7 @@ function copy(): Copy {
         reload: '刷新', empty: '这个目录里没有可读的文件', loading: '加载中…',
         save: '保存', cancel: '取消', placeholder: '写点什么…（可留空，仅做标记）',
         notes: '批注', remove: '删除', markOnly: '仅标记（无文字）',
+        ask: '问 AI', sentToChat: '已发进对话 —— 切到「对话」页签看回答',
       }
     : {
         label: 'Read', workspace: 'Workspace', pick: 'Pick a markdown file to read', back: '← Back to list',
@@ -253,6 +265,7 @@ function copy(): Copy {
         reload: 'Reload', empty: 'Nothing readable in this folder', loading: 'Loading…',
         save: 'Save', cancel: 'Cancel', placeholder: 'Write something… (empty = just mark it)',
         notes: 'Notes', remove: 'Remove', markOnly: 'Marker only',
+        ask: 'Ask AI', sentToChat: 'Sent into the chat — switch to the Chat tab for the answer',
       }
 }
 
@@ -421,9 +434,11 @@ loader?.load({
         loggedProps.current = true
         console.log('[readnote] slot props keys =', Object.keys(props ?? {}))
         console.log('[readnote] sessionId =', String(sessionId))
-        // 探测工作区能力：sessions.get() 只认「活会话」，所以工作区得从 props 拿。
-        console.log('[readnote] useWorkspaces type =', typeof (props as any)?.useWorkspaces)
-        console.log('[readnote] useSessions type =', typeof (props as any)?.useSessions)
+        // 探测输入接口：如果有「发消息」的动作，划词提问就能走正统路径而不是自造。
+        const ia = (props as { inputActions?: Record<string, unknown> })?.inputActions
+        console.log('[readnote] inputActions =', ia ? Object.keys(ia).join(',') : String(ia))
+        const vi = (props as { viewRequest?: Record<string, unknown> })?.viewRequest
+        console.log('[readnote] viewRequest =', vi ? Object.keys(vi).join(',') : String(vi))
       }
 
       const [cwd, setCwd] = useState('')
@@ -434,6 +449,7 @@ loader?.load({
       const [pending, setPending] = useState<Pending | null>(null)
       const [draft, setDraft] = useState('')
       const [notes, setNotes] = useState<Note[]>([])
+      const [notice, setNotice] = useState('')
 
       const docRef = useRef<HTMLDivElement | null>(null)
       /** 每条批注气泡相对 .readnote__doc 的落点（向左时靠 translateX(-100%) 对齐）。 */
@@ -591,10 +607,38 @@ loader?.load({
         window.getSelection()?.removeAllRanges()
       }
 
+      /**
+       * 把「当前选区 + 输入框里的问题」发进会话。
+       * 走会话而不是自己调模型，是为了让回答落在会话日志里 —— 「钉回原文」的前提。
+       */
+      const askAi = (): void => {
+        if (pending === null || doc === null || sessionId === undefined) return
+        const question = draft.trim()
+        if (question.length === 0) return
+        setBusy(true)
+        setError(null)
+        setNotice('')
+        void post(ASK_PATH, { sessionId, doc: doc.name, quote: pending.anchor.quote, question })
+          .then((data) => {
+            if (data?.ok) {
+              setNotice(t.sentToChat)
+              setPending(null)
+              setDraft('')
+              window.getSelection()?.removeAllRanges()
+            } else {
+              setError(`ask failed: ${data?.reason ?? data?.error ?? 'unknown'}\n${data?.message ?? ''}`)
+              setPending(null)
+            }
+          })
+          .catch((e: unknown) => setError(`ask error: ${String(e)}`))
+          .finally(() => setBusy(false))
+      }
+
       const backToDir = (): void => {
         setDoc(null)
         setNotes([])
         setPending(null)
+        setNotice('')
       }
 
       const bar = h(
@@ -603,6 +647,7 @@ loader?.load({
         h('span', { className: 'readnote__name' }, doc ? doc.name : t.pick),
         doc ? h('span', { className: 'readnote__meta' }, humanSize(doc.size)) : null,
         h('span', { className: 'readnote__spacer' }),
+        notice.length > 0 ? h('span', { className: 'readnote__notice' }, notice) : null,
         doc !== null && notes.length > 0 ? h('span', { className: 'readnote__meta' }, `${t.notes} ${notes.length}`) : null,
         h('span', { className: 'readnote__meta', title: 'client build tag' }, BUILD_TAG),
         busy ? h('span', { className: 'readnote__meta' }, t.loading) : null,
@@ -728,7 +773,11 @@ loader?.load({
               'div',
               {
                 className: 'readnote-sel',
-                style: { left: `${Math.max(12, Math.min(pending.x, window.innerWidth - 320))}px`, top: `${pending.y}px` },
+                style: {
+                  // 两个方向都夹进视口：选区靠底/靠右时，浮层不能跑到屏幕外。
+                  left: `${Math.max(12, Math.min(pending.x, window.innerWidth - 320))}px`,
+                  top: `${Math.max(12, Math.min(pending.y, window.innerHeight - 240))}px`,
+                },
               },
               h('p', { className: 'readnote-sel__quote' }, pending.anchor.quote.slice(0, 120)),
               h('textarea', {
@@ -744,6 +793,7 @@ loader?.load({
                 h('span', { className: 'readnote-sel__spacer' }),
                 h('button', { className: 'readnote-sel__cancel', type: 'button', onClick: () => setPending(null) }, t.cancel),
                 h('button', { className: 'readnote-sel__go', type: 'button', onClick: saveNote }, t.save),
+                h('button', { className: 'readnote-sel__ask', type: 'button', onClick: askAi }, t.ask),
               ),
             )
 

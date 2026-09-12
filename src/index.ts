@@ -30,6 +30,8 @@ const LIST_PATH = '/__readnote/list'
 const READ_PATH = '/__readnote/read'
 const NOTES_READ_PATH = '/__readnote/notes'
 const NOTES_SAVE_PATH = '/__readnote/notes/save'
+const DIAG_PATH = '/__readnote/diag'
+const ASK_PATH = '/__readnote/ask'
 
 /**
  * 批注库放在工作区里的位置。
@@ -492,5 +494,171 @@ export function apply(ctx: any): void {
     }),
   )
 
-  console.log('[readnote] host 端点已注册:', LIST_PATH, READ_PATH, NOTES_READ_PATH, NOTES_SAVE_PATH)
+  // 诊断端点：列出关键 host 服务在运行时**真实**暴露的方法。
+  // 原则是「问进程，不猜文档」—— 见 BUILDING.md 4.7 那三轮猜错的教训。
+  ctx.effect(() =>
+    host.register({
+      kind: 'exact',
+      path: DIAG_PATH,
+      handler: async (req: any, res: any) => {
+        if (rejectConnectionRequest(connection, req, res)) return
+        const names = [
+          'agents', 'llm', 'sessions', 'workspaceRegistry', 'conversation',
+          'commands', 'systemPrompt', 'storageDomain', 'sessionPersistence',
+        ]
+        const report: Record<string, unknown> = {}
+        for (const name of names) {
+          const svc = ctx.get(name)
+          report[name] =
+            svc === undefined || svc === null
+              ? 'MISSING'
+              : Object.getOwnPropertyNames(Object.getPrototypeOf(svc)).slice(0, 40)
+        }
+
+        // 带 sessionId 时再探一层：agent / session 实例上有什么方法。
+        // 目的是搞清「怎么把一条消息发进已有会话」—— 这决定问答面板走哪条路。
+        let payload: any = {}
+        try {
+          const raw = await readBody(req)
+          if (raw) payload = JSON.parse(raw)
+        } catch {
+          // 探测请求体坏了不影响服务清单，继续返回。
+        }
+        if (typeof payload?.sessionId === 'string' && payload.sessionId.length > 0) {
+          const agentsSvc = ctx.get('agents')
+          const agent = agentsSvc?.get?.(payload.sessionId)
+          report._agent = agent
+            ? Object.getOwnPropertyNames(Object.getPrototypeOf(agent)).slice(0, 40)
+            : 'MISSING'
+          // agents.list() 里到底有什么 —— 判断 agent 的 key 是不是 sessionId。
+          try {
+            const all = agentsSvc?.list?.() ?? []
+            report._agentCount = Array.isArray(all) ? all.length : -1
+            report._agentIds = Array.isArray(all)
+              ? all.slice(0, 6).map((item: any) => ({
+                  id: item?.id ?? null,
+                  sessionId: item?.sessionId ?? null,
+                  keys: Object.keys(item ?? {}).slice(0, 10),
+                }))
+              : 'N/A'
+          } catch (error: any) {
+            report._agentListError = error?.message ?? String(error)
+          }
+          const session = ctx.get('sessions')?.get?.(payload.sessionId)
+          report._session = session
+            ? Object.getOwnPropertyNames(Object.getPrototypeOf(session)).slice(0, 40)
+            : 'MISSING'
+          // 抄一条**真实**消息的结构 —— 我们要自己造一条发进会话，
+          // 照抄会话里已有的形状，比读文档猜字段靠谱（BUILDING.md 4.7 的教训）。
+          if (session !== undefined && session !== null && typeof session.deriveMessages === 'function') {
+            try {
+              const messages = session.deriveMessages()
+              report._messageCount = Array.isArray(messages) ? messages.length : -1
+              const last = Array.isArray(messages) && messages.length > 0 ? messages[messages.length - 1] : null
+              report._lastMessageKeys = last === null ? 'NONE' : Object.keys(last)
+              report._lastMessage = last === null ? 'NONE' : JSON.parse(JSON.stringify(last))
+            } catch (error: any) {
+              report._messageError = error?.message ?? String(error)
+            }
+          }
+        }
+        sendJson(res, 200, { ok: true, services: report })
+      },
+    }),
+  )
+
+  // 划词提问：把问题作为一条**真实用户消息**发进当前会话。
+  //
+  // 为什么走会话而不是自己调模型（像 dsh-ask-in-sidebar 那样）：
+  //   设计稿里「钉回原文」这个动作的前提，是回答本来就落在会话日志里。
+  //   独立调模型的话，钉的是个游离于会话之外的回答，链路就断了。
+  //
+  // 消息形状是照会话里已有消息抄的（keys: role / content / source / id），
+  // 不是读文档猜的 —— 见 BUILDING.md 4.7。
+  ctx.effect(() =>
+    host.register({
+      kind: 'exact',
+      path: ASK_PATH,
+      handler: async (req: any, res: any) => {
+        if (rejectConnectionRequest(connection, req, res)) return
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { error: 'method not allowed' })
+          return
+        }
+        let payload: any = {}
+        try {
+          const raw = await readBody(req)
+          if (raw) payload = JSON.parse(raw)
+        } catch {
+          sendJson(res, 400, { error: 'bad json body' })
+          return
+        }
+
+        const sessionId = payload?.sessionId
+        if (typeof sessionId !== 'string' || sessionId.length === 0) {
+          sendJson(res, 400, { error: 'sessionId required' })
+          return
+        }
+        const question = typeof payload?.question === 'string' ? payload.question.trim() : ''
+        if (question.length === 0) {
+          sendJson(res, 400, { error: 'question required' })
+          return
+        }
+        const quote = typeof payload?.quote === 'string' ? payload.quote : ''
+        const doc = typeof payload?.doc === 'string' ? payload.doc : ''
+
+        const agents = ctx.get('agents')
+        let agent = agents?.get?.(sessionId)
+        let resumed = false
+        if ((agent === undefined || agent === null) && typeof agents?.resume === 'function') {
+          // agent 只在「正在工作」时留在 store 里，空闲就被释放。
+          // 先试着自己唤醒它 —— 失败了再如实告诉用户，而不是让他猜。
+          try {
+            agent = await agents.resume(sessionId)
+            resumed = true
+          } catch {
+            agent = undefined
+          }
+        }
+        if (agent === undefined || agent === null) {
+          // 会话没有活着的 agent 时**明确告诉前端**，而不是静默失败。
+          sendJson(res, 200, {
+            ok: false,
+            reason: 'agent-not-live',
+            message: '这个会话当前没有活跃 agent（dsh 只为正在工作的会话保留它，空闲即释放，resume 也没成功）。先在对话框里发一句话唤醒它，再回来提问。',
+          })
+          return
+        }
+
+        const text = [
+          doc.length > 0 ? `【readnote】读《${doc}》时对这段话有疑问：` : '【readnote】对这段话有疑问：',
+          '',
+          quote.length > 0 ? `> ${quote.replace(/\n/g, '\n> ')}` : '',
+          '',
+          question,
+        ].join('\n')
+
+        try {
+          agent.followup({
+            role: 'user',
+            content: [{ type: 'text', text }],
+            source: { kind: 'user' },
+          })
+          sendJson(res, 200, { ok: true, resumed })
+        } catch (error: any) {
+          sendJson(res, 500, { error: error?.message ?? String(error) })
+        }
+      },
+    }),
+  )
+
+  console.log(
+    '[readnote] host 端点已注册:',
+    LIST_PATH,
+    READ_PATH,
+    NOTES_READ_PATH,
+    NOTES_SAVE_PATH,
+    ASK_PATH,
+    DIAG_PATH,
+  )
 }
