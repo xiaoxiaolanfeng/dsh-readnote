@@ -2,7 +2,7 @@
 
 > **阅读增强** —— 把 AI 的回答**钉回原文**的文档阅读器。DeepSeek Harness 插件。
 
-**状态：设计完成，开发中** · 完整设计见 [DESIGN.md](./DESIGN.md)
+**状态：开发中** · 设计见 [DESIGN.md](./DESIGN.md) · 构建手记（生态调研 / dsh 机制 / 踩坑清单）见 [BUILDING.md](./BUILDING.md)
 
 ---
 
