@@ -48,12 +48,26 @@
 npm run build
 ```
 
-- 改 **client**（`src/client.ts`）→ build → 刷新浏览器
-- 改 **host**（`src/index.ts`）→ build → patch 里 `?v=` 递增 → 刷新浏览器
+- 改 **client**（`src/client/**`）→ build → 刷新浏览器（改完递增 `BUILD_TAG`）
+- 改 **host**（`src/index.ts`、`src/host/**`）→ build → patch 里 `?v=` 递增 → 刷新浏览器
 
-两条都**不需要重启 dsh**。原理见 `BUILDING.md` 第四节 4.4。
+两条都**不需要重启 dsh**。原理见 `BUILDING.md` 第四节 4.4 与 4.17。
 
-## 两条必须遵守的实现约束
+## 源码结构约定
+
+**不写巨型文件。** 一个功能 = 一组文件，按「谁能单独被读懂/替换」切：
+
+| 目录 | 放什么 | 不放什么 |
+|---|---|---|
+| `src/host/routes/` | 端点实现 | 公共前置检查（那在 `host/http.ts`） |
+| `src/client/hooks/` | 状态与副作用 | 任何 JSX |
+| `src/client/ui/` | 纯展示组件 | 任何业务状态、任何 `ctx` 访问 |
+| `src/client/{markdown,react,platform}` | 宿主边界 | 业务逻辑 |
+
+## 三条必须遵守的实现约束
 
 1. `window.__ModuleLoader__.load({ id })` 的 id 必须与 `package.json` 的 `name` 完全一致。
-2. `src/client.ts` **不能出现 `import` / `export`**，编译后必须保持普通脚本形态。
+2. client 源码可以拆成多个 ES 模块，但**产物**必须保持普通脚本形态
+   （esbuild 打成 CJS 再包进 `factory`）。
+3. **两个半边都要 bundle 成单文件**：host 用 `tsc` 直出多文件时，改子模块靠 `?v=`
+   刷新不了（ESM 的 query 不被相对导入继承，实测）。见 `BUILDING.md` 4.17。

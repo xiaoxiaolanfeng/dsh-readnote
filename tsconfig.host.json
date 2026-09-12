@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    // 只出类型声明：运行时代码由 scripts/build-host.mjs 打成单文件
+    // （原因见那个脚本的注释 —— ESM 的 query 不继承，多文件产物的热重载是假的）。
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "outDir": "lib",
+    "rootDir": "src"
+  },
+  "include": ["src/index.ts", "src/host/**/*.ts"]
+}

@@ -24,12 +24,15 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "watch": "tsc -p tsconfig.json --watch",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "build": "npm run build:host && npm run build:client",
+    "build:host": "tsc -p tsconfig.host.json && node scripts/build-host.mjs",
+    "build:client": "node scripts/build-client.mjs",
+    "typecheck": "tsc -p tsconfig.json"
   },
   "devDependencies": {
     "@types/node": "^22.20.2",
+    "@types/react": "^19.3.0",
+    "esbuild": "^0.28.2",
     "typescript": "^6.0.0"
   },
   "engines": {

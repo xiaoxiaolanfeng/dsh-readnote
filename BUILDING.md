@@ -134,6 +134,25 @@ export const PLATFORM_MODULES = [
 
 **通用教训**：遇到性能问题，「加个上限」往往是错觉式的修复。**先问数据模型/访问模型对不对** —— 换成按需分层，问题整个消失，而不是被压住。
 
+### 2.5 两个半边都 bundle 成单文件（哪怕源码是能直接跑的 ESM）
+
+一开始只有 client 需要构建（浏览器要的是能直接 eval 的普通脚本），host 用 `tsc` 直出多文件 ESM 就够了 —— 源码即产物，调试也直观。
+
+**这个判断是错的**，理由不在"能不能跑"，而在"改了能不能生效"：dsh 的热重载靠改 URL（`?v=N`）绕过 Node 的模块缓存，而 **query 不会被相对导入继承**（4.17 实测）。多文件产物里只有入口重新加载，`lib/host/**` 全部命中旧缓存 —— 表现是「改了代码、bump 了版本号、行为没变」，**不报任何错**。
+
+于是改成：
+
+| 产物 | 工具 | 格式 | 理由 |
+|---|---|---|---|
+| `lib/client.js` | esbuild | CJS，包进 `ModuleLoader.load` | 浏览器按普通脚本加载 |
+| `lib/index.js` | esbuild | ESM 单文件 | 让 `?v=` 覆盖整棵树 |
+| `lib/**/*.d.ts` | tsc | `emitDeclarationOnly` | 类型不外泄实现 |
+
+**取舍**：多了一步构建，调试时看的是 bundle 而不是源码（所以两个 bundle 都带"请勿手改，源码在哪"的文件头注释）。换来的是**开发循环里不用重启 dsh**——这个插件一天要改几十次，重启成本远大于构建成本。
+
+> **"源码即产物"只有在"产物即部署单元"时才成立。** 这里部署单元是"一个 URL"，
+> 所以构建步骤不是可选项。
+
 ---
 
 ## 三、dsh 机制笔记（能讲出来的部分）
@@ -446,6 +465,73 @@ document.querySelectorAll('.readnote-bubble')  →  1
 
 ---
 
+### 4.16 宿主组件取回来是 `undefined`，界面却不报错
+
+| 现象 | 原因 | 解法 |
+|---|---|---|
+| 重构后 markdown 全变成纯文本（`<pre>`），控制台**一行错都没有** | 取 `MarkdownText` 时用 `typeof v === 'function'` 判断，但 shell 导出的是 **`memo()` 包过的对象**（`$$typeof: Symbol(react.memo)`），`typeof` 是 `'object'` | 判断改成「函数 **或** 非 null 对象」：`typeof v === 'function' \|\| (typeof v === 'object' && v !== null)` |
+
+诊断证据是那行一直留着的探测日志：
+
+```
+[readnote] primitives keys = default,BrandWordmark,Button,CodeBlock,…,MarkdownText,classifyFileType,…
+[readnote] MarkdownText = object      ← 修复前是 undefined，修复后是 object
+```
+
+**为什么这个坑特别值钱**：它走的是"兜底分支"，所以**任何地方都不会报错**。
+如果没有那行 `console.log`，唯一的现象就是"markdown 没渲染"，而人会先去怀疑样式、
+怀疑数据、怀疑缓存 —— 实际原因在一个 `typeof` 上。
+
+> **兜底分支是 bug 最好的藏身处。** 凡是 `x ? 正常 : 兜底` 的写法，
+> 都要能回答"我怎么知道现在走的是哪一支"。
+
+### 4.17 Node ESM 的 query **不会**被相对导入继承
+
+dsh 用 `file:///…/lib/index.js?v=N` 加载插件，靠改 URL 绕过 Node 的 ESM 模块缓存。
+本机实测（Node 22.20.0）：
+
+```
+entry  = file:///C:/…/entry.mjs?v=23
+child  = file:///C:/…/child.mjs          ← query 没了
+```
+
+| 现象 | 原因 | 解法 |
+|---|---|---|
+| host 拆成多文件后，改了 `lib/host/*.js`、patch 里 `?v=` 递增了，**行为没变** | 只有入口那一份的 URL 变了，子模块仍以无 query 的 URL 命中旧缓存 | **host 半边也 bundle 成单文件**（`scripts/build-host.mjs`）—— 整棵树只有一个 URL，`?v=` 才是真的有效 |
+
+这条直接推翻了我原先写在 patch 注释里的推断（"子模块 URL 会带上同一个 query"）。
+**改 URL 能不能强制重新加载，取决于被改的是不是唯一那一份。**
+拆文件本身没错，错在拆完还指望旧的缓存绕过手段继续管用。
+
+### 4.18 宿主**不给**视图确定高度（会话激活时）
+
+`.conversation.view` 的容器在会话激活时命中的是这条规则（源码：
+`packages/client/ui-conversation/src/client/skeleton/ConversationRoot.module.css`）：
+
+```css
+.root[data-phase='active'] .viewArea { flex: 1 0 auto; min-height: auto; }
+```
+
+也就是说宿主的设计是「**视图内容有多高就多高，整段交给外层 `.scrollBody` 滚**」——
+官方 Chat 视图正是「消息区 + sticky 输入框共用一个外层滚动条」。
+
+| 现象 | 原因 | 解法 |
+|---|---|---|
+| 对话栏设了 `overflow-y: auto` 却没有滚动条；滚动条长在整页上；`scrollHeight === clientHeight` | 视图高度是内容撑出来的（实测 14683px），`height: 100%` 对着 auto 高度的父级退化成 `auto`，链路上所有 `overflow` 全部失效 | 用 `useScrollportHeight` 向上找最近的可滚动祖先，量出 `clientHeight` 写成根元素的内联高度；根元素再加 `position: sticky; top: 0` 兜底 |
+
+实测数字（1600×1000 视口）：
+
+```
+rootH: 924   scrollportH: 924   bodyOverflow: auto   bodyScrollable: True
+对话栏滚到 1500 → 正文 scrollTop = 0，外层 scrollTop = 0
+正文滚到  900 → 对话栏 scrollTop 仍是 1500
+```
+
+> **在别人的布局系统里做"应用"，先问清楚高度是谁给的。**
+> "我设了 overflow 却没滚动条"几乎永远是**高度链断了**，而不是 `overflow` 写错了。
+
+---
+
 ## 五、最终开发工作流（两条都不用重启 dsh）
 
 ```sh
@@ -454,8 +540,16 @@ npm run build
 
 | 改什么 | 生效方式 |
 |---|---|
-| **client 半边**（`src/client.ts`） | build → **硬刷新浏览器**（`Ctrl+Shift+R`；开着 DevTools 的 Disable cache 时普通刷新即可）。改完顺手递增 `BUILD_TAG` |
-| **host 半边**（`src/index.ts`） | build → patch 里 `?v=` 递增 → 刷新浏览器（recompose 自动触发） |
+| **client 半边**（`src/client/**`） | build → **硬刷新浏览器**（`Ctrl+Shift+R`）。改完顺手递增 `BUILD_TAG`，用它确认浏览器到底加载了哪一版 |
+| **host 半边**（`src/index.ts`、`src/host/**`） | build → patch 里 `?v=` 递增 → 刷新浏览器（recompose 自动触发） |
+
+**两边都必须是"整包一个文件"**，否则 `?v=` 只对入口生效（见 4.17）：
+
+| 产物 | 生成方式 | 为什么 |
+|---|---|---|
+| `lib/client.js` | esbuild → CJS，包进 `__ModuleLoader__.load({ id, factory })` | 浏览器把它当**普通脚本**加载，不能有 `import`/`export` |
+| `lib/index.js` | esbuild → ESM 单文件 | 让 `?v=` 覆盖整棵树 |
+| `lib/**/*.d.ts` | `tsc --emitDeclarationOnly` | 只出类型；运行时代码不经过 tsc |
 
 patch 配置（`$DSH_HOME/profiles/web/cordis.patch.yml`）：
 
@@ -466,6 +560,41 @@ patch 配置（`$DSH_HOME/profiles/web/cordis.patch.yml`）：
       config: {}
 ```
 
+### 5.1 源码结构（一个功能 = 一组文件，不写巨型文件）
+
+```
+src/
+  index.ts                  host 入口：name / inject / apply（只做服务装配）
+  host/
+    constants.ts            端点路径与各种上限
+    types.ts                DirEntry / ChatMessage / HostServices
+    http.ts                 sendJson / readBody / 跨站守卫 / registerRoute
+    workspace.ts            工作区定位（三条路）+ safeResolve + 分层列目录
+    notes.ts                批注库的原子读写
+    message.ts              会话消息的投影与构造（含缺 id 那件事）
+    register.ts             统一注册八个端点
+    routes/{files,notes,chat,diag}.ts
+  client/
+    index.ts                client 入口：只做「注样式 + 注册 slot」
+    constants.ts types.ts copy.ts storage.ts anchor.ts api.ts styles.ts
+    markdown.ts             MarkdownText 的取用与兜底
+    react.ts                React 绑定层（收口 + 放宽类型）
+    platform.d.ts           shell 注入模块的环境声明
+    hooks/                  useReader / useNoteLayer / useSessionMessages
+                            / useChatWidth / useScrollportHeight
+    ui/                     App / TopBar / DocList / DocView / ChatPanel
+                            / ChatResizer / SelectionBar / RenderBoundary
+```
+
+**分层的判据是"谁能单独被读懂/替换"**，不是行数：
+
+- `hooks/` 里没有 JSX，`ui/` 里没有业务状态 —— 读 `useReader` 就能完整读懂
+  「目录 → 文档 → 批注 → 提问 → 钉回原文」这条流程，不用在一千行里翻。
+- `markdown.ts` / `react.ts` / `platform.d.ts` 三个文件是**宿主边界**：
+  宿主给什么、怎么取、取不到怎么办，全在这三处，宿主升级时只改这里。
+- `http.ts` 的 `registerRoute` 把「跨站守卫 + 方法检查 + 解析请求体 + 兜异常」
+  收成一处 —— 这四步原来在八个 handler 里各抄一遍，**漏一个就是一个 CSRF 面**。
+
 ---
 
 ## 六、面试可以讲的几个点
@@ -473,5 +602,8 @@ patch 配置（`$DSH_HOME/profiles/web/cordis.patch.yml`）：
 1. **竞品调研不是看 star 排行，而是找"可信信号"** —— GitHub 的 `language` 字段会骗人，但 `tsconfig.json` 的有无把生态切成了 83★+ 和 5★- 两半。
 2. **实测比推断值钱** —— 装 7 个插件亲自用，得出 A（入口不可发现）+ B（对象错了）两条结论，直接定了产品方向。
 3. **技术选型可以做"第三条路"** —— 纯 DOM 派做不了原生页签，重方案要 40 个依赖；查到 `PLATFORM_MODULES` 后，用「手写 ModuleLoader + require baseline external」同时拿到了两者，client 只有 10 KB。
-4. **理解框架的缓存语义** —— patchReload 只监听 patch 文件、ESM 模块缓存按 URL 记账，这两条决定了开发工作流怎么设计。
+4. **理解框架的缓存语义** —— patchReload 只监听 patch 文件、ESM 模块缓存按 URL 记账，这两条决定了开发工作流怎么设计。**但"改 URL 就能刷新"有个前提**：被改的必须是唯一那一份 —— query 不会被相对导入继承，所以两边产物都 bundle 成单文件（4.17）。
 5. **`Model-visible ⟺ logged`** —— 这条铁律怎么反向决定了批注的数据模型（待实现，是下一个要讲的设计点）。
+6. **在别人的布局系统里做"应用"，先问清楚高度是谁给的** —— 宿主在会话激活时刻意让视图 `flex: 1 0 auto`（内容撑多高就多高，交给外层滚）。发现这一点之前，我一直在调自己的 `overflow`；发现之后，一行 `clientHeight` 测量就解决了（4.18）。
+7. **静默降级是最好的 bug 藏身处** —— `MarkdownText` 被 `typeof` 判成非函数、于是走了 `<pre>` 兜底分支，全程零报错。凡是 `x ? 正常 : 兜底` 的地方，都要能回答"我怎么知道现在走的是哪一支"（4.16）。
+8. **重复代码本身就是风险** —— 八个 handler 各抄一遍「跨站守卫 + 方法检查 + 解析请求体」，漏一个就是一个 CSRF 面。抽成 `registerRoute` 之后，安全性从"每次记得写"变成"默认就有"。

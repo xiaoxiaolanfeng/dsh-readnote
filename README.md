@@ -47,8 +47,35 @@
 - [x] 批注持久化：旁挂 `.readnote/annotations.json`，重开还在
 - [x] 划词提问：问题作为真实用户消息发进当前会话
 - [x] 钉回答：把会话里的回答取回、编辑、落成原文旁的笔记
+- [x] 本地记忆：记住上次读到哪、最近打开列表
+- [x] 阅读页右侧对话栏：**可拖拽调宽**、**独立滚动**
 - [ ] 问答面板做成对话流的过滤器（只显示与本文相关的问答）
 - [ ] 导出带批注的 md（旁挂 → 内联，给分享用）
+- [ ] 发布到 dshmarket / 插件市场
+
+## 界面
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ dsh-readnote/BUILDING.md  28 KB  ✨钉回答     批注 2  ← 返回列表 │  顶栏（固定）
+├──────────────────────────────────┬──────────────────────────┤
+│                                  │ 对话 · 12                 │
+│  # 构建手记 · Building readnote   │ ┌──────────────────────┐ │
+│                                  │ │ 我：这段的核心判断是？ │ │
+│  正文…（markdown，与聊天区同款   │ └──────────────────────┘ │
+│  渲染器，支持表格 / 代码 / 公式）  │ ┌──────────────────────┐ │
+│                                  │ │ AI：…                 │ │
+│    ┌─────────────┐               │ └──────────────────────┘ │
+│    │ 批注气泡     │ ← 挂在原文旁边 │      ↑ 这一栏自己滚       │
+│    └─────────────┘               │                          │
+│         ↑ 这一栏自己滚             │                          │
+├──────────────────────────────────┴──────────────────────────┤
+│ 划词后浮出：引用原文 + [取消] [保存] [问 AI]                     │
+└─────────────────────────────────────────────────────────────┘
+                              ↑ 中间这条 5px 缝可以拖（双击复位）
+```
+
+左侧正文与右侧对话栏**各滚各的**，顶栏不动。
 
 ## 开发方式（本机）
 
@@ -62,16 +89,40 @@ npm install && npm run build
 # $DSH_HOME/profiles/web/cordis.patch.yml
 - insert:
     - id: readnote
-      name: 'D:/aitool/dsh-readnote/lib/index.js'
+      name: 'file:///D:/aitool/dsh-readnote/lib/index.js?v=1'   # 改 host 就递增
       config: {}
 ```
 
 改代码 → `npm run build` → **刷新浏览器**即可，**无需重启 dsh**（host 与 client 半边均已验证热生效）。
 
+**改 client 不用动 `?v=`，改 host 必须递增** —— 原因值得记一笔：dsh 靠改 URL 绕过
+Node 的 ESM 模块缓存，而 **query 不会被相对导入继承**（本机实测）。所以两边产物都
+bundle 成**单文件**，`?v=` 才对整棵树有效。详见 [BUILDING.md](./BUILDING.md) 4.17。
+
 两条实现约束记在这里，免得以后踩：
 
 - client 的 `ModuleLoader.load({ id })` 必须与 `package.json` 的 `name` 完全一致，否则 client-modules 拒绝挂载
-- `src/client.ts` 不能出现 `import` / `export`，编译后必须保持普通脚本形态
+- `src/client/` 的产物必须保持**普通脚本**形态：源码可以拆成多个 ES 模块，但 bundle 出来要包进 `__ModuleLoader__.load` 的 `factory` 里
+
+## 源码结构
+
+```
+src/
+  index.ts          host 入口（只做服务装配）
+  host/             端点实现：constants / types / http / workspace / notes
+                    / message / register / routes/{files,notes,chat,diag}
+  client/
+    index.ts        client 入口（只做「注样式 + 注册 slot」）
+    markdown.ts     宿主 MarkdownText 的取用与兜底
+    react.ts        React 绑定层（收口 + 放宽类型）
+    hooks/          useReader / useNoteLayer / useSessionMessages
+                    / useChatWidth / useScrollportHeight
+    ui/             App / TopBar / DocList / DocView / ChatPanel
+                    / ChatResizer / SelectionBar / RenderBoundary
+```
+
+`hooks/` 里没有 JSX，`ui/` 里没有业务状态 —— 读 `useReader.ts` 就能完整读懂
+「目录 → 文档 → 批注 → 提问 → 钉回原文」这条流程。
 
 ## License
 

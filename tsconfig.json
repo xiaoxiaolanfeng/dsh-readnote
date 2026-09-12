@@ -4,6 +4,11 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "moduleResolution": "bundler",
+    // 源码里 import 一律写 `.ts`：Node 的 ESM 解析器要求带扩展名，
+    // 而 tsc 默认只接受 `.js`。开这两个开关后，既能在源码里写 `.ts`，
+    // 又能在产物里被改写成 `.js`（TS 5.7+ 的 rewriteRelativeImportExtensions）。
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
     "strict": true,
     "declaration": true,
     "outDir": "lib",
@@ -13,7 +18,8 @@
     "forceConsistentCasingInFileNames": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
-    "noEmitOnError": true
+    "noEmitOnError": true,
+    "noEmit": true
   },
   "include": ["src/**/*.ts"]
 }
