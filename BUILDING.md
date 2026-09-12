@@ -116,6 +116,24 @@ export const PLATFORM_MODULES = [
 
 风险排序：**最大风险在数据模型（会话事件 + 锚点定位），不在 UI 外壳**。所以先把「能读到文档」这条管道打通，再动批注。
 
+### 2.4 目录浏览：分层，而不是递归扫描
+
+第一版让 host **递归扫描整个工作区**、一次返回所有 markdown（带 300 条上限）。结果是「阅读页签一直转圈打不开」。
+
+**错在哪**：只限制了**结果数量**，没限制**遍历成本**——在一棵几十万文件的目录树上，它得走完整棵树才知道凑够没有。后来加「1.5 秒时间预算」只是**限制伤害**，不是解决问题。
+
+**更好的方案（由用户提出）**：像文件管理器一样**分层**——先列一层目录，点进去再列下一层。
+
+| | 递归扫描 | 分层浏览 |
+|---|---|---|
+| 单次请求成本 | 整棵树的遍历 | 一个 `readdir` |
+| 会不会卡 | 会，取决于目录树规模 | 不会 |
+| 交互 | 一屏倒出全部（还未必找得到） | 符合直觉的钻取 |
+
+**收益**：成本从「与目录树规模成正比」变成「与当前层条目数成正比」，而且顺带得到了面包屑导航。
+
+**通用教训**：遇到性能问题，「加个上限」往往是错觉式的修复。**先问数据模型/访问模型对不对** —— 换成按需分层，问题整个消失，而不是被压住。
+
 ---
 
 ## 三、dsh 机制笔记（能讲出来的部分）
@@ -245,12 +263,54 @@ dsh 的架构铁律：**任何进入模型请求的东西，都必须能从会�
 | 改 patch 触发 recompose 了，但新装的插件没生效 | recompose **不重读** `package.json` 的 bundles | 装插件要重启；改 patch 才能热生效 |
 | **改了 host 代码，recompose 后端点仍然是旧的** | **Node 的 ESM 模块缓存按 URL 记账**：路径不变，`import()` 直接返回旧模块 | patch 里的路径加 query：`file:///D:/.../index.js?v=3`，每次改动 +1（构成新的模块身份） |
 | 不确定端点到底注册没有 | 一开始用状态码判断，但 **dsh 对所有未知 POST 路径都返回 405**，无法区分 | **看响应体**：401 + `{"error":"unauthorized"}` 才是我们 handler 回的；405 + 空 body 是静态服务的默认回应 |
+| **改了 client 代码、刷新浏览器，行为完全没变** | 浏览器缓存了 `lib/client.js`。**更坑的是它会让人误判成「修复无效」** —— 我因此在错误的结论上白查了两轮，新代码其实从未被加载 | 硬刷新 `Ctrl+Shift+R`；开发期在 DevTools → Network 勾 **Disable cache** 并保持开着。**并且给 client 加 `BUILD_TAG` 把版本显示在界面上**：先确认版本，再怀疑代码 |
 
 ### 4.5 产品类
 
 | 现象 | 教训 |
 |---|---|
 | 第一版做成右下角浮动按钮 | 用户直接指出"我们不是要放在轨迹旁边的嘛"——**入口形态本身就是需求**，A 类失败就是这么来的 |
+
+### 4.6 性能类（两次「卡死」）| 现象 | 原因 | 解法 |
+|---|---|---|
+| **阅读页签打不开，一直转圈** | 代码只限制了「最多返回 300 个文件」，但**遍历成本不受结果数量约束** —— 在一棵几十万文件的目录树上会一直走不完。旁证：我这边等效的 PowerShell 扫描命令同样 180 秒超时 | 给遍历加**时间预算**（1.5 秒到点就带着已找到的结果返回）+ 递归深度 4→2 |
+| **打开某些 markdown 直接卡死主线程** | 超长文档被全量交给 `MarkdownText` 渲染 | 渲染前截断到 12 万字符并显式提示 |
+
+**通用教训：限制资源用量时，「结果数量」和「计算成本」是两件事，必须分别限制。**
+只写 `limit: 300` 会给人一种"已经保护过了"的错觉，实际上一行都没防住 —— 因为瓶颈在遍历，不在结果。
+
+### 4.7 复用 shell 组件类（三轮猜错，一行定位）
+
+| 现象 | 原因 | 解法 |
+|---|---|---|
+| **打开含代码块的 markdown → 整个页签白屏**<br>`TypeError: Cannot read properties of undefined (reading 'code')` | shell 里的 `MarkdownText` 读的是 **`i.labels.code.copyLabel`**（嵌套、**无可选链**）；而源码 clone 里是 **`codeLabels?.copyLabel`**（扁平、带可选链）。照 clone 写 → `undefined.code` → 崩 | 传 `labels: { code: { copyLabel, copiedLabel } }` |
+| **一个畸形输入就让整个页签看起来「坏了」** | React 渲染抛错会卸载整棵子树，而一开始没加错误边界 | 加 `RenderBoundary`（class 组件 + `getDerivedStateFromError`），异常显示成带**文件名 + 调用栈**的红框，而不是白屏 |
+
+**方法论教训（比这个 bug 本身值钱）**
+
+我花了三轮在**源码 clone** 里翻找根因，三次全猜错 —— 因为**实际运行的根本不是那份源码**：
+用户装的是 dsh `0.1.5-rc.1`，而 clone 是早先写文章时留下的另一份快照。
+
+**真正一次定位的做法**：浏览器报错信息里已经给了文件名和行列号 —— `index-BKQ_L1z6.js:96:51`。
+那个文件就在磁盘上（`dsh-web-frontend/dist/assets/`），**直接读那一行**，答案就在眼前：
+
+```js
+`, lang: a, streaming: i.streaming,
+   copyLabel: i.labels.code.copyLabel,      // ← 就是这里
+   copiedLabel: i.labels.code.copiedLabel
+```
+
+再往前后各读一点，还能拿到组件的完整 props 签名：
+
+```js
+I.memo(function({ text: r, streaming: i = !1, labels: s, fileMentions: a, pathImages: c })
+```
+
+> **源码 clone 只是参考，运行时的构建产物才是事实。** 排查框架内部行为时，
+> 先拿报错的文件名+行列号去磁盘上读构建产物，比在源码里 grep 快一个数量级。
+>
+> 附带一条：`dsh-client-ui-primitives` 在 `node_modules` 里**根本不存在** ——
+> 它是 `PLATFORM_MODULES` 里 shell 静态打入的，所以"找包看源码"这条路从一开始就不通。
 
 ---
 
@@ -262,7 +322,7 @@ npm run build
 
 | 改什么 | 生效方式 |
 |---|---|
-| **client 半边**（`src/client.ts`） | build → **刷新浏览器** |
+| **client 半边**（`src/client.ts`） | build → **硬刷新浏览器**（`Ctrl+Shift+R`；开着 DevTools 的 Disable cache 时普通刷新即可）。改完顺手递增 `BUILD_TAG` |
 | **host 半边**（`src/index.ts`） | build → patch 里 `?v=` 递增 → 刷新浏览器（recompose 自动触发） |
 
 patch 配置（`$DSH_HOME/profiles/web/cordis.patch.yml`）：
@@ -270,7 +330,7 @@ patch 配置（`$DSH_HOME/profiles/web/cordis.patch.yml`）：
 ```yaml
 - insert:
     - id: readnote
-      name: 'file:///D:/aitool/dsh-readnote/lib/index.js?v=3'
+      name: 'file:///D:/aitool/dsh-readnote/lib/index.js?v=N'   # N 每改一次 host 就递增
       config: {}
 ```
 

@@ -2,12 +2,17 @@
  * dsh-readnote · host half.
  *
  * 为 client 半边提供阅读所需的数据，两个只读端点：
- *   POST /__readnote/list  —— 列出当前会话工作区里的 markdown 文件
+ *   POST /__readnote/list  —— 列出工作区内**某一层**的目录与文件（不递归）
  *   POST /__readnote/read  —— 读取工作区内某个文件的文本内容
+ *
+ * 为什么是「一层」而不是递归扫全树：
+ *   递归的瓶颈在遍历成本，而遍历成本不受「结果数量上限」约束 —— 在一棵
+ *   几十万文件的目录树上会一直走不完（实测踩过）。分层列目录把每次请求的
+ *   成本压到一个 readdir，交互上也和文件管理器一致。
  *
  * 安全约束：
  *   - 两个端点都走 connection.requestRejection 守卫，跨站浏览器无法触发。
- *   - 路径必须落在会话工作区内（safeResolve 挡 ../ 穿越），不给任意文件读取。
+ *   - 路径必须落在会话工作区内（safeResolve 挡 ../ 穿越）。
  *   - 单文件有大小上限，避免把浏览器卡死。
  */
 
@@ -26,28 +31,29 @@ const READ_PATH = '/__readnote/read'
 /** 单个文件大小上限（2 MB）—— 超过就不往浏览器送。 */
 const MAX_FILE_BYTES = 2 * 1024 * 1024
 
-/** 一次最多列出多少个文件。 */
-const MAX_FILES = 300
+/** 单层目录最多返回多少条，防止某个目录里堆了几万个文件。 */
+const MAX_ENTRIES = 500
 
-/** 递归深度上限，避免在大仓里走太深。 */
-const MAX_DEPTH = 4
+/** 明确跳过的目录名。 */
+const SKIP_DIRS = new Set(['node_modules', '.git', '.cache', '.next', 'dist', 'build', 'lib', 'coverage', '__pycache__'])
 
-/** 明确跳过的目录。 */
-const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'lib', '.cache', '.next'])
-
-/** 认作 markdown 的扩展名。 */
+/** 认作可读 markdown 的扩展名。 */
 const MD_EXTENSIONS = new Set(['.md', '.markdown', '.mdx'])
 
-/** 一个可读 markdown 文件的索引项。 */
-interface DocEntry {
-  /** 相对工作区的路径，前端展示用。 */
-  name: string
-  /** 绝对路径。 */
+/** 一层目录里的一个条目。 */
+interface DirEntry {
+  /** 相对工作区的路径，用 / 分隔。 */
   path: string
-  /** 字节数。 */
+  /** 展示名。 */
+  name: string
+  /** 目录还是文件。 */
+  type: 'dir' | 'file'
+  /** 字节数（目录为 0）。 */
   size: number
-  /** 最后修改时间（毫秒）。 */
+  /** 最后修改时间（毫秒，目录为 0）。 */
   mtime: number
+  /** 是否可以打开阅读（markdown 才是 true）。 */
+  readable: boolean
 }
 
 /**
@@ -117,46 +123,6 @@ function resolveCwd(session: any): string | null {
 }
 
 /**
- * 在工作区里递归收集 markdown 文件，按修改时间倒序。
- * @param root - 工作区根目录。
- * @param limit - 最多返回多少条。
- * @returns 文件索引。
- */
-async function collectMarkdown(root: string, limit: number): Promise<DocEntry[]> {
-  const out: DocEntry[] = []
-
-  async function walk(dir: string, depth: number): Promise<void> {
-    if (out.length >= limit || depth > MAX_DEPTH) return
-    let entries
-    try {
-      entries = await readdir(dir, { withFileTypes: true })
-    } catch {
-      return
-    }
-    for (const entry of entries) {
-      if (out.length >= limit) return
-      if (entry.name.startsWith('.') || SKIP_DIRS.has(entry.name)) continue
-      const full = join(dir, entry.name)
-      if (entry.isDirectory()) {
-        await walk(full, depth + 1)
-        continue
-      }
-      if (!entry.isFile()) continue
-      if (!MD_EXTENSIONS.has(extname(entry.name).toLowerCase())) continue
-      try {
-        const info = await stat(full)
-        out.push({ name: relative(root, full).split(sep).join('/'), path: full, size: info.size, mtime: info.mtimeMs })
-      } catch {
-        // 读不到元信息就跳过这一个文件，不影响其它结果。
-      }
-    }
-  }
-
-  await walk(root, 0)
-  return out.sort((a, b) => b.mtime - a.mtime)
-}
-
-/**
  * 只在 root 之内解析目标路径，挡住 ../ 穿越。
  * @param root - 工作区根目录。
  * @param target - 目标路径（绝对或相对工作区）。
@@ -167,6 +133,50 @@ function safeResolve(root: string, target: string): string | null {
   const abs = isAbsolute(target) ? resolve(target) : resolve(rootResolved, target)
   if (abs !== rootResolved && !abs.startsWith(rootResolved + sep)) return null
   return abs
+}
+
+/**
+ * 列出工作区内某一层的条目（只读一层，不做递归）。
+ * @param root - 工作区根目录。
+ * @param rel - 相对工作区的目录路径，空串表示根。
+ * @returns 目录在前、同类按名称排序的条目。
+ */
+async function listDirectory(root: string, rel: string): Promise<DirEntry[]> {
+  const target = rel.length > 0 ? safeResolve(root, rel) : resolve(root)
+  if (target === null) throw new Error('path outside workspace')
+
+  const dirents = await readdir(target, { withFileTypes: true })
+  const out: DirEntry[] = []
+
+  for (const entry of dirents) {
+    if (out.length >= MAX_ENTRIES) break
+    if (entry.name.startsWith('.') || SKIP_DIRS.has(entry.name)) continue
+    const childRel = rel.length > 0 ? `${rel}/${entry.name}` : entry.name
+
+    if (entry.isDirectory()) {
+      out.push({ path: childRel, name: entry.name, type: 'dir', size: 0, mtime: 0, readable: false })
+      continue
+    }
+    if (!entry.isFile()) continue
+    try {
+      const info = await stat(join(target, entry.name))
+      out.push({
+        path: childRel,
+        name: entry.name,
+        type: 'file',
+        size: info.size,
+        mtime: info.mtimeMs,
+        readable: MD_EXTENSIONS.has(extname(entry.name).toLowerCase()),
+      })
+    } catch {
+      // 读不到元信息就跳过这一个文件，不影响整层结果。
+    }
+  }
+
+  return out.sort((a, b) => {
+    if (a.type !== b.type) return a.type === 'dir' ? -1 : 1
+    return a.name.localeCompare(b.name)
+  })
 }
 
 /**
@@ -216,11 +226,12 @@ export function apply(ctx: any): void {
           return
         }
 
+        const rel = typeof payload?.dir === 'string' ? payload.dir.replace(/^\/+|\/+$/g, '') : ''
         try {
-          const files = await collectMarkdown(cwd, MAX_FILES)
-          sendJson(res, 200, { ok: true, dir: cwd, files })
+          const entries = await listDirectory(cwd, rel)
+          sendJson(res, 200, { ok: true, workspace: cwd, dir: rel, entries })
         } catch (error: any) {
-          sendJson(res, 500, { error: error?.message ?? String(error) })
+          sendJson(res, 404, { ok: false, error: error?.message ?? String(error) })
         }
       },
     }),
@@ -273,7 +284,13 @@ export function apply(ctx: any): void {
             return
           }
           const content = await readFile(abs, 'utf8')
-          sendJson(res, 200, { ok: true, path: abs, name: relative(cwd, abs).split(sep).join('/'), size: info.size, content })
+          sendJson(res, 200, {
+            ok: true,
+            path: abs,
+            name: relative(cwd, abs).split(sep).join('/'),
+            size: info.size,
+            content,
+          })
         } catch (error: any) {
           sendJson(res, 404, { error: error?.message ?? String(error) })
         }
